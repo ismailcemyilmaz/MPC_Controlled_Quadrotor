@@ -298,18 +298,19 @@ print(f"τ_sat:    {sat*100:.1f}%")
 ```
 
 ---
-## Current Results
+## Current Results :
+## Hover test // hover(0,0,4,4)
 # Physical Parameters
-G       = 9.81
-MASS    = 1.280
-I_DIAG  = (22.916e-3, 22.916e-3, 22.132e-3)
-ARM_LEN = 0.23
-KF      = 6.5e-4
+G       = 9.81,
+MASS    = 1.280,
+I_DIAG  = (22.916e-3, 22.916e-3, 22.132e-3),
+ARM_LEN = 0.23,
+KF      = 6.5e-4,
 KM      = 1e-5
 
 # MPC configuration
-MPC_N  = 20
-MPC_TS = 0.05
+MPC_N  = 20,
+MPC_TS = 0.05,
 
 TAU_Y_FF = 0.0 #0.20
 

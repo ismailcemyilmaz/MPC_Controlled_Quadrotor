@@ -26,7 +26,7 @@ except ImportError:
     GENOMIX_AVAILABLE = False
     print("[client] genomix not found — simulation only")
 
-# ── Fiziksel sabitler ────────────────────────────────────────────────────────
+# ── Physical Constants ────────────────────────────────────────────────────────
 G       = 9.81
 MASS    = 1.280
 I_DIAG  = (22.916e-3, 22.916e-3, 22.132e-3)
@@ -34,18 +34,18 @@ ARM_LEN = 0.23
 KF      = 6.5e-4
 KM      = 1e-5
 
-# ── MPC konfigürasyonu ───────────────────────────────────────────────────────
+# ── MPC Configuration ───────────────────────────────────────────────────────
 MPC_N  = 20
 MPC_TS = 0.05
 
-TAU_Y_FF = 0.20
+TAU_Y_FF = 0.0 #0.20
 
 _MPC_KWARGS = dict(
-    Q_pos=5.0,     Q_vel=2.0,
-    Q_att=6.0,
-    Q_omega=1.5,   Q_omega_r=3.0,
-    P_scale=5.0,
-    R_f=0.02,      R_tau=0.10,       R_tau_z=0.15,
+    Q_pos=6.0,     Q_vel=3.5,
+    Q_att=7.0,
+    Q_omega=8.0,   Q_omega_r=3.0,
+    P_scale=10.0,
+    R_f=0.04,      R_tau=0.10,       R_tau_z=0.15,
     tau_max=0.80,  tau_z_max=0.12,
     f_min=0.05*MASS*G,
     f_max_scale=2.5,

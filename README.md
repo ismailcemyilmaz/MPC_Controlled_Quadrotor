@@ -298,30 +298,45 @@ print(f"τ_sat:    {sat*100:.1f}%")
 ```
 
 ---
+## Current Results
+# Physical Parameters
+G       = 9.81
+MASS    = 1.280
+I_DIAG  = (22.916e-3, 22.916e-3, 22.132e-3)
+ARM_LEN = 0.23
+KF      = 6.5e-4
+KM      = 1e-5
 
-## Known Issues
+# MPC configuration
+MPC_N  = 20
+MPC_TS = 0.05
 
-### Model-Plant Mismatch (Gazebo)
+TAU_Y_FF = 0.0 #0.20
 
-**Symptom:** Only 1 out of 7 test runs (Run 4) successfully reached the z=4m target.
+_MPC_KWARGS = dict(
+    Q_pos=6.0,     Q_vel=3.5,
+    Q_att=7.0,
+    Q_omega=8.0,   Q_omega_r=3.0,
+    P_scale=10.0,
+    R_f=0.04,      R_tau=0.10,       R_tau_z=0.15,
+    tau_max=0.80,  tau_z_max=0.12,
+    f_min=0.05*MASS*G,
+    f_max_scale=2.5,
+    alpha_land=2.0, W_land=500.0,
+)
 
-**Cause:** The ground-contact dynamics present in the Gazebo simulation are completely missing from the MPC model. While the drone is still on the ground during motor spin-up, angular momentum builds up. This induces a structural oscillation (≈2.3 Hz) observed across all runs.
+_LOCAL_MPC_KWARGS = dict(
+    n_obs_max  = 5,
+    R_drone    = 0.30,
+    W_obs      = 10000.0,
+)
 
-**Status:** Under active investigation — awaiting verification of the Gazebo SDF model's `<inertial><pose>` values.
+<img width="1905" height="739" alt="mpc_log_plot4" src="https://github.com/user-attachments/assets/868c1761-53f3-4d7c-9fc7-4a8e85fa9f81" />
+<img width="2389" height="1038" alt="mpc_log_plot3" src="https://github.com/user-attachments/assets/3f8df1d1-ec14-498b-a8f8-2247118a5324" />
+<img width="2388" height="1479" alt="mpc_log_plot2" src="https://github.com/user-attachments/assets/434e0918-f987-4b55-9785-460699a65c38" />
+<img width="2389" height="1920" alt="mpc_log_plot1" src="https://github.com/user-attachments/assets/7c949ae1-b389-4eea-b118-0784a247ec11" />
 
-### Systematic tau_y Bias
 
-**Symptom:** The mean value of `tau_y` is persistently negative across all runs (-0.10 to -0.43 Nm).
-
-**Likely Cause:** Center of Mass (CoM) displacement or rotor asymmetry within the Gazebo drone model.
-
-**Workaround:** Added a feedforward term inside `wrench_to_rotorcraft`: `tau_y += TAU_Y_FF`.
-
-### MPC_TS = 0.025s Fails to Work
-
-**Cause:** Python is single-threaded; the MPC solve time (~11ms) combined with loop overhead yields an effective period of 36.9ms. Because the solver integrates assuming a 25ms step but updates at 37ms, a model drift of 12ms occurs at every single step. Additionally, when N=20 and Ts=0.025, the prediction horizon is 0.5s—which is shorter than the oscillation period (~0.44s).
-
-**Solution:** Stick to `MPC_TS=0.05`. To extend the horizon safely, try `N=30, Ts=0.05` (horizon=1.5s).
 
 ---
 

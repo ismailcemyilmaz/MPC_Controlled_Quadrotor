@@ -330,13 +330,10 @@ _LOCAL_MPC_KWARGS = dict(
     R_drone    = 0.30,
     W_obs      = 10000.0,
 )
-
-<img width="1905" height="739" alt="mpc_log_plot4" src="https://github.com/user-attachments/assets/868c1761-53f3-4d7c-9fc7-4a8e85fa9f81" />
-<img width="2389" height="1038" alt="mpc_log_plot3" src="https://github.com/user-attachments/assets/3f8df1d1-ec14-498b-a8f8-2247118a5324" />
-<img width="2388" height="1479" alt="mpc_log_plot2" src="https://github.com/user-attachments/assets/434e0918-f987-4b55-9785-460699a65c38" />
 <img width="2389" height="1920" alt="mpc_log_plot1" src="https://github.com/user-attachments/assets/7c949ae1-b389-4eea-b118-0784a247ec11" />
-
-
+<img width="2388" height="1479" alt="mpc_log_plot2" src="https://github.com/user-attachments/assets/434e0918-f987-4b55-9785-460699a65c38" />
+<img width="2389" height="1038" alt="mpc_log_plot3" src="https://github.com/user-attachments/assets/3f8df1d1-ec14-498b-a8f8-2247118a5324" />
+<img width="1905" height="739" alt="mpc_log_plot4" src="https://github.com/user-attachments/assets/868c1761-53f3-4d7c-9fc7-4a8e85fa9f81" />
 
 ---
 

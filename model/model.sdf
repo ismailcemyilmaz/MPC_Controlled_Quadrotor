@@ -1,0 +1,214 @@
+<?xml version="1.0" ?>
+<sdf version="1.5">
+  <model name="mrsim-quadrotor-lidar">
+    <link name="base">
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.015</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.015</iyy><iyz>0</iyz>
+          <izz>0.007</izz>
+        </inertia>
+      </inertial>
+
+      <collision name="base">
+        <geometry>
+          <cylinder><radius>0.1</radius><length>0.05</length></cylinder>
+        </geometry>
+      </collision>
+      <!-- three spheres to make contact stable -->
+      <collision name="land_1">
+        <pose>0.1 0 0 0 0 0</pose>
+        <geometry>
+          <sphere><radius>0.03</radius></sphere>
+        </geometry>
+      </collision>
+      <collision name="land_2">
+        <pose>-0.05 0.086 0 0 0 0</pose>
+        <geometry>
+          <sphere><radius>0.03</radius></sphere>
+        </geometry>
+      </collision>
+      <collision name="land_3">
+        <pose>-0.05 -0.086 0 0 0 0</pose>
+        <geometry>
+          <sphere><radius>0.03</radius></sphere>
+        </geometry>
+      </collision>
+
+      <visual name="body">
+        <geometry>
+          <cylinder><radius>0.08</radius><length>0.05</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>1.0 0.6 0.4 1</ambient>
+          <diffuse>1.0 0.6 0.4 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Lidar görsel temsili (küçük silindir) -->
+      <visual name="lidar_body">
+        <pose>0 0 0.055 0 0 0</pose>
+        <geometry>
+          <cylinder><radius>0.025</radius><length>0.02</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.1 0.1 0.1 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="arm-1">
+        <pose>0.125 0 0 0 1.5708 0</pose>
+        <geometry>
+          <cylinder><radius>0.01</radius><length>0.25</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>1.0 0.2 0.2 1</ambient>
+          <diffuse>1.0 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+      <visual name="arm-2">
+        <pose>0 0.125 0 0 1.5708 1.5708</pose>
+        <geometry>
+          <cylinder><radius>0.01</radius><length>0.25</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1</ambient>
+          <diffuse>0.6 0.6 0.6 1</diffuse>
+        </material>
+      </visual>
+      <visual name="arm-3">
+        <pose>-0.125 0 0 0 1.5708 0</pose>
+        <geometry>
+          <cylinder><radius>0.01</radius><length>0.25</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1</ambient>
+          <diffuse>0.6 0.6 0.6 1</diffuse>
+        </material>
+      </visual>
+      <visual name="arm-4">
+        <pose>0 -0.125 0 0 1.5708 1.5708</pose>
+        <geometry>
+          <cylinder><radius>0.01</radius><length>0.25</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1</ambient>
+          <diffuse>0.6 0.6 0.6 1</diffuse>
+        </material>
+      </visual>
+
+      <!--
+        ═══════════════════════════════════════════════════════════════
+        2D LİDAR SENSÖR
+        ═══════════════════════════════════════════════════════════════
+        Yerleşim: gövde merkezinin 6cm üzerinde (z=0.06)
+          - Gövde silindiri: r=0.08, h=0.05 → üst yüzey z=+0.025
+          - Kollar z=0 düzleminde → yatay tarama düzlemi kolları kesmez
+          - min_range=0.10m → r=0.08 gövde yüzeyi tarama dışı kalır
+
+        Topic: /lidar/scan
+        Gazebo Ionic (gz-sim) gpu_lidar sensörü kullanılıyor.
+        gz topic --echo --topic /lidar/scan ile test edilebilir.
+        ═══════════════════════════════════════════════════════════════
+      -->
+      <sensor name="lidar_2d" type="gpu_lidar">
+        <pose>0 0 0.06 0 0 0</pose>
+        <topic>/lidar/scan</topic>
+        <update_rate>10</update_rate>
+        <lidar>
+          <scan>
+            <horizontal>
+              <samples>360</samples>
+              <resolution>1</resolution>
+              <min_angle>-3.14159265358979</min_angle>
+              <max_angle>3.14159265358979</max_angle>
+            </horizontal>
+            <!-- Yalnızca yatay (2D) tarama -->
+            <vertical>
+              <samples>1</samples>
+              <resolution>1</resolution>
+              <min_angle>0</min_angle>
+              <max_angle>0</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.10</min>
+            <max>8.0</max>
+            <resolution>0.01</resolution>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </lidar>
+        <always_on>true</always_on>
+        <visualize>true</visualize>
+      </sensor>
+
+    </link>
+
+    <include>
+      <uri>model://mrsim-rotor</uri>
+      <name>rotor-1</name>
+      <pose>0.23 0 0 0 0 0</pose>
+    </include>
+    <joint name="motor-1" type="revolute">
+      <parent>base</parent>
+      <child>rotor-1::propeller</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <include>
+      <uri>model://mrsim-rotor</uri>
+      <name>rotor-2</name>
+      <pose>0 0.23 0 0 0 0</pose>
+    </include>
+    <joint name="motor-2" type="revolute">
+      <parent>base</parent>
+      <child>rotor-2::propeller</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <include>
+      <uri>model://mrsim-rotor</uri>
+      <name>rotor-3</name>
+      <pose>-0.23 0 0 0 0 0</pose>
+    </include>
+    <joint name="motor-3" type="revolute">
+      <parent>base</parent>
+      <child>rotor-3::propeller</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <include>
+      <uri>model://mrsim-rotor</uri>
+      <name>rotor-4</name>
+      <pose>0 -0.23 0 0 0 0</pose>
+    </include>
+    <joint name="motor-4" type="revolute">
+      <parent>base</parent>
+      <child>rotor-4::propeller</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <plugin name="mrsim" filename="mrsim-gazebo.so">
+      <link>base</link>
+
+      <rotors>
+        <noise>0.03</noise>
+        <cf>6.5e-4</cf>
+        <ct>1e-5</ct>
+        <vfxy>0.5</vfxy><vfz>0.5</vfz>
+        <vtxy>0.5</vtxy><vtz>0.5</vtz>
+        <rotor><joint spin="cw">motor-1</joint></rotor>
+        <rotor><joint spin="ccw">motor-2</joint></rotor>
+        <rotor><joint spin="cw">motor-3</joint></rotor>
+        <rotor><joint spin="ccw">motor-4</joint></rotor>
+      </rotors>
+    </plugin>
+
+  </model>
+</sdf>

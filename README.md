@@ -147,6 +147,9 @@ MPC_Lidar/
 └── logs/mpc/                    # Test logs (.npz)
 
 ```
+## Architecture
+<img width="2720" height="2320" alt="architecture_diagram" src="https://github.com/user-attachments/assets/fd65240d-b5bc-498c-8834-c995fa556fd6" />
+<img width="2720" height="2400" alt="control_loop_dataflow" src="https://github.com/user-attachments/assets/4bb141d7-4a50-4ee8-90d7-7f662623546c" />
 
 ---
 

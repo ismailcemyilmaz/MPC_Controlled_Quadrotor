@@ -19,7 +19,7 @@ import numpy as np
 import time
 
 _CMAKE = '/usr/local/MATLAB/R2025b/bin/glnxa64/cmake/bin'
-if _CMAKE not in os.environ.get('PATH', ''):
+if os.path.isdir(_CMAKE) and _CMAKE not in os.environ.get('PATH', ''):
     os.environ['PATH'] = _CMAKE + ':' + os.environ.get('PATH', '')
 
 _ACADOS_CANDIDATES = ['/opt/acados', os.path.expanduser('~/acados')]
@@ -32,6 +32,12 @@ os.environ.setdefault('ACADOS_SOURCE_DIR', ACADOS_SOURCE_DIR)
 _ACADOS_LIB = os.path.join(ACADOS_SOURCE_DIR, 'lib')
 if _ACADOS_LIB not in os.environ.get('LD_LIBRARY_PATH', ''):
     os.environ['LD_LIBRARY_PATH'] = _ACADOS_LIB + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+
+import ctypes
+for _lib in ['libblasfeo.so', 'libhpipm.so', 'libqpOASES_e.so', 'libacados.so']:
+    _path = os.path.join(_ACADOS_LIB, _lib)
+    if os.path.isfile(_path):
+        ctypes.CDLL(_path, mode=ctypes.RTLD_GLOBAL)
 
 try:
     import casadi as cs
@@ -209,7 +215,7 @@ class QuadrotorMPC:
             Q_pos,    Q_pos,    Q_pos,
             Q_vel,    Q_vel,    Q_vel,
             Q_att,    Q_att,    Q_att,    Q_att,
-            Q_omega,  Q_omega,  Q_omega_r,   # p, q, r — r ayrı
+            Q_omega,  Q_omega,  Q_omega_r,   # p, q, r — separate weight for yaw rate
             R_f,      R_tau,    R_tau,    R_tau_z,
         ])
 
@@ -220,7 +226,7 @@ class QuadrotorMPC:
             s*Q_pos, s*Q_pos, s*Q_pos,
             s*Q_vel, s*Q_vel, s*Q_vel,
             s*Q_att, s*Q_att, s*Q_att, s*Q_att,
-            0.0, 0.0, 0.0,     # terminal'de omega penalize edilmez
+            0.0, 0.0, 0.0,     # no omega penalty at terminal
         ])
 
     def _apply_weights(self):
@@ -228,13 +234,10 @@ class QuadrotorMPC:
             self.solver.cost_set(k, 'W', self._W)
         self.solver.cost_set(self.N, 'W', self._WN)
 
-    # ── Solver reset (warm-start temizleme) ───────────────────────────────────
+    # ── Solver reset ─────────────────────────────────────────────────────────
 
     def reset(self, x0: np.ndarray = None):
-        """
-        Acados warm-start state'ini temizle.
-        Gazebo reset veya yeni deney başlamadan önce çağır.
-        """
+        """Clear warm-start state. Call before starting a new experiment."""
         if x0 is None:
             x0 = np.array([0,0,0, 0,0,0, 1,0,0,0, 0,0,0], dtype=float)
         if x0[6] < 0:          # antipodal fix

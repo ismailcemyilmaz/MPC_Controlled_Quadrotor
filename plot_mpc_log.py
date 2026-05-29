@@ -478,12 +478,16 @@ ax_tu.legend()
 
 fig4.tight_layout()
 
-# ── Kaydet veya Göster ────────────────────────────────────────────────────────
-if args.save:
-    base = log_path.replace('.npz', '')
-    for i, fig in enumerate([fig1, fig2, fig3, fig4], 1):
-        fname = f'{base}_plot{i}.png'
-        fig.savefig(fname, dpi=args.dpi, bbox_inches='tight')
-        print(f'[plot] Kaydedildi: {fname}')
-else:
+# ── Save and/or show ─────────────────────────────────────────────────────────
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PLOT_DIR   = os.path.join(_SCRIPT_DIR, 'plots')
+os.makedirs(_PLOT_DIR, exist_ok=True)
+
+tag = os.path.basename(os.path.dirname(log_path)) or 'run'
+for i, fig in enumerate([fig1, fig2, fig3, fig4], 1):
+    fname = os.path.join(_PLOT_DIR, f'{tag}_plot{i}.png')
+    fig.savefig(fname, dpi=args.dpi, bbox_inches='tight')
+    print(f'[plot] Saved: {fname}')
+
+if not args.save:
     plt.show()

@@ -16,7 +16,11 @@ usage() {
 
 # Default settings
 middleware=pocolibs
-world="${TK3LAB_WS}/gazebo/worlds/quad.world"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+world="${SCRIPT_DIR}/worlds/quad.world"
+
+# Make our custom models visible to Gazebo
+export GZ_SIM_RESOURCE_PATH="${SCRIPT_DIR}/model:${GZ_SIM_RESOURCE_PATH:-}"
 
 # Components WITHOUT nhfc
 components="

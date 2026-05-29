@@ -1,0 +1,11 @@
+# Auto-generated solver code
+acados_generated/
+c_generated_code/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs (large binary files)
+logs/
+

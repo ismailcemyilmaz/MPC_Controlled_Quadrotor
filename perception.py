@@ -1,15 +1,15 @@
 """
 perception.py
 =============
-Quadrotor MPC — Algılama Katmanı
+Quadrotor MPC — Perception Layer
 ---------------------------------
-Üç seviyeli perception pipeline:
+Three-level perception pipeline:
 
-  Level 1 — Gazebo Ground Truth   : gz transport / CLI ile model pozisyonu
-  Level 2 — 2D Lidar              : Gazebo lidar plugin → clustering → engeller
-  Level 3 — Static Map            : Bilinen sabit engeller (en basit, production)
+  Level 1 — Gazebo Ground Truth   : model positions via gz transport / CLI
+  Level 2 — 2D Lidar              : Gazebo lidar plugin -> clustering -> obstacles
+  Level 3 — Static Map            : Known static obstacles (simplest, production)
 
-Kullanım (quadrotor_mpc_client.py'ye import et):
+Usage (import in quadrotor_mpc_client.py):
     from perception import PerceptionManager
     _perception = PerceptionManager(level=1)
     _perception.start()
@@ -30,33 +30,31 @@ from collections import defaultdict
 from typing import List, Tuple, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tip tanımı
-# ─────────────────────────────────────────────────────────────────────────────
 Obstacle = Tuple[np.ndarray, float]   # (p_obs [3,], R_obs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LEVEL 1 — GAZEBO GROUND TRUTH
-#  Gazebo Ionic'in gz-transport veya gz CLI ile model pozisyonlarını okur.
-#  Gerçek sensör gerekmez; test ve geliştirme için idealdir.
+#  Reads model positions from Gazebo Ionic via gz-transport or gz CLI.
+#  No real sensor needed; ideal for testing and development.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GazeboGroundTruth:
     """
-    Gazebo world'deki model isimlerini takip eder, pozisyonları döndürür.
+    Tracks model names in the Gazebo world, returns their positions.
 
-    Önce gz-transport Python binding dener (hızlı, <1ms).
-    Başarısız olursa gz CLI'ye (subprocess) düşer (~10ms).
-    İkisi de başarısız olursa /world/default/pose/info topic'i
-    raw UDP ile dinler (Gazebo Ionic default port 11345).
+    Tries gz-transport Python binding first (fast, <1ms).
+    Falls back to gz CLI (subprocess, ~10ms).
+    If both fail, /world/default/pose/info topic is
+    listened via raw UDP (Gazebo Ionic default port 11345).
     """
 
     def __init__(self, obstacle_models: List[Tuple[str, float]],
                  update_rate_hz: float = 10.0):
         """
         obstacle_models : [(model_name, radius), ...]
-            Örnek: [('cylinder_1', 0.3), ('box_obstacle', 0.4)]
-        update_rate_hz  : kaç Hz'de güncellensin
+            Example: [('cylinder_1', 0.3), ('box_obstacle', 0.4)]
+        update_rate_hz  : polling frequency
         """
         self.obstacle_models = obstacle_models
         self.update_period   = 1.0 / update_rate_hz
@@ -69,14 +67,14 @@ class GazeboGroundTruth:
         self._detect_method()
 
     def _detect_method(self):
-        """Hangi gz arayüzünün kullanılabileceğini belirle."""
+        """Determine which gz interface is available."""
         # 1. gz-transport Python binding
         for ver in [13, 12, 11, 10]:
             try:
                 mod = __import__(f'gz.transport{ver}')
                 self._gz_transport = mod
                 self._method = 'transport'
-                print(f"[perception] gz.transport{ver} Python binding bulundu")
+                print(f"[perception] gz.transport{ver} Python binding found")
                 return
             except ImportError:
                 pass
@@ -87,17 +85,17 @@ class GazeboGroundTruth:
                                capture_output=True, text=True, timeout=2)
             if r.returncode == 0:
                 self._method = 'cli'
-                print("[perception] gz CLI bulundu — model polling aktif")
+                print("[perception] gz CLI found — model polling active")
                 return
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
         self._method = 'unavailable'
-        print("[perception] WARNING: gz transport ve CLI bulunamadı")
-        print("[perception]   → StaticObstacles veya ManualInput kullan")
+        print("[perception] WARNING: gz transport and CLI not found")
+        print("[perception]   -> Use StaticObstacles or ManualInput instead")
 
     def _get_pose_cli(self, model_name: str) -> Optional[np.ndarray]:
-        """gz model CLI ile model pozisyonu oku."""
+        """Read model position via gz model CLI."""
         try:
             r = subprocess.run(
                 ['gz', 'model', '-m', model_name, '-p'],
@@ -105,10 +103,7 @@ class GazeboGroundTruth:
             )
             if r.returncode != 0:
                 return None
-            # Çıktı formatı: "X: 2.0\nY: 0.0\nZ: 1.5\n..."
-            # veya JSON benzeri — Ionic sürümüne göre değişir
             out = r.stdout
-            # Numerik regex ile parse
             nums = re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', out)
             if len(nums) >= 3:
                 return np.array([float(nums[0]),
@@ -119,16 +114,14 @@ class GazeboGroundTruth:
         return None
 
     def _get_pose_transport(self, model_name: str) -> Optional[np.ndarray]:
-        """gz-transport Python binding ile pose oku."""
+        """Read pose via gz-transport Python binding."""
         try:
             node = self._gz_transport.Node()
-            # /world/default/pose/info topic'ini bir kez oku
-            # (gerçek uygulamada subscriber kullanmak daha verimli)
             msgs = []
             def cb(msg): msgs.append(msg)
             topic = '/world/default/pose/info'
             node.subscribe(topic, cb)
-            time.sleep(0.05)   # bir mesaj bekle
+            time.sleep(0.05)
             for msg in msgs:
                 for pose in msg.pose:
                     if pose.name == model_name:
@@ -139,7 +132,7 @@ class GazeboGroundTruth:
         return None
 
     def _poll(self):
-        """Arka plan thread: obstacle listesini periyodik güncelle."""
+        """Background thread: periodically update obstacle list."""
         while self._running:
             new_obs = []
             for model_name, radius in self.obstacle_models:
@@ -152,7 +145,7 @@ class GazeboGroundTruth:
                 if pos is not None:
                     new_obs.append((pos, radius))
                 else:
-                    print(f"[perception] WARNING: '{model_name}' bulunamadı")
+                    print(f"[perception] WARNING: '{model_name}' not found")
 
             with self._lock:
                 self._obstacles = new_obs
@@ -161,13 +154,13 @@ class GazeboGroundTruth:
 
     def start(self):
         if self._method == 'unavailable':
-            print("[perception] GazeboGroundTruth başlatılamadı")
+            print("[perception] GazeboGroundTruth could not start")
             return
         self._running = True
         self._thread  = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
-        print(f"[perception] GazeboGroundTruth başlatıldı "
-              f"({len(self.obstacle_models)} model, {1/self.update_period:.0f} Hz)")
+        print(f"[perception] GazeboGroundTruth started "
+              f"({len(self.obstacle_models)} models, {1/self.update_period:.0f} Hz)")
 
     def stop(self):
         self._running = False
@@ -180,16 +173,16 @@ class GazeboGroundTruth:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LEVEL 2 — 2D LİDAR (Gazebo plugin)
-#  Gazebo'daki gpu_lidar plugin'den LaserScan verisi okur.
-#  Polar → Kartezyen → DBSCAN clustering → engel küreleri
+#  LEVEL 2 — 2D LIDAR (Gazebo plugin)
+#  Reads LaserScan from Gazebo gpu_lidar plugin.
+#  Polar -> Cartesian -> DBSCAN clustering -> obstacle spheres
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Lidar2DPerception:
     """
-    Gazebo 2D lidar plugin'den LaserScan okur, engelleri cluster'lar.
+    Reads LaserScan from Gazebo 2D lidar plugin, clusters into obstacles.
 
-    Drone SDF'ine şunu ekle:
+    Drone SDF should include:
         <sensor name='lidar' type='gpu_lidar'>
           <topic>/lidar/scan</topic>
           <update_rate>10</update_rate>
@@ -215,10 +208,10 @@ class Lidar2DPerception:
                  drone_radius: float = 0.30,
                  max_range: float    = 6.0,
                  cluster_eps: float  = 0.25,   # DBSCAN epsilon [m]
-                 cluster_min: int    = 3,       # min nokta/cluster
-                 min_obs_r: float    = 0.15,    # min engel yarıçapı [m]
-                 max_obs_r: float    = 1.50,    # max engel yarıçapı [m]
-                 drone_height: float = 1.5):    # sabit yükseklik (2D)
+                 cluster_min: int    = 3,       # min points/cluster
+                 min_obs_r: float    = 0.15,    # min obstacle radius [m]
+                 max_obs_r: float    = 1.50,    # max obstacle radius [m]
+                 drone_height: float = 1.5):    # fixed height (2D)
         self.topic        = topic
         self.drone_radius = drone_radius
         self.max_range    = max_range
@@ -233,14 +226,14 @@ class Lidar2DPerception:
         self._running = False
         self._subscriber = None
 
-        self._drone_pos = np.zeros(3)   # dışarıdan güncellenir
+        self._drone_pos = np.zeros(3)
 
     def update_drone_pos(self, pos: np.ndarray):
-        """Drone pozisyonunu her adımda güncelle (LaserScan dönüşümü için)."""
+        """Update drone position each step (for LaserScan transform)."""
         self._drone_pos = pos.copy()
 
     def _polar_to_cartesian(self, ranges, angle_min, angle_increment):
-        """LaserScan polar → dünya çerçevesi kartezyen noktalar."""
+        """LaserScan polar -> world frame cartesian points."""
         points = []
         dx, dy = self._drone_pos[0], self._drone_pos[1]
         for i, r in enumerate(ranges):
@@ -253,12 +246,12 @@ class Lidar2DPerception:
         return np.array(points) if points else np.empty((0, 2))
 
     def _dbscan_cluster(self, points: np.ndarray):
-        """Basit DBSCAN implementasyonu (sklearn gerektirmez)."""
+        """Simple DBSCAN implementation (no sklearn dependency)."""
         if len(points) == 0:
             return []
 
         n      = len(points)
-        labels = [-1] * n   # -1 = gürültü
+        labels = [-1] * n   # -1 = noise
         cluster_id = 0
 
         def neighbors(idx):
@@ -272,7 +265,7 @@ class Lidar2DPerception:
             visited[i] = True
             nb = neighbors(i)
             if len(nb) < self.cluster_min:
-                labels[i] = -1   # gürültü
+                labels[i] = -1   # noise
                 continue
             labels[i] = cluster_id
             queue = list(nb)
@@ -294,7 +287,7 @@ class Lidar2DPerception:
         return [np.array(pts) for pts in clusters.values()]
 
     def _clusters_to_obstacles(self, clusters, drone_z: float):
-        """Her cluster → merkez + yarıçap → Obstacle tuple."""
+        """Each cluster -> center + radius -> Obstacle tuple."""
         obs = []
         for pts in clusters:
             center = pts.mean(axis=0)
@@ -307,8 +300,8 @@ class Lidar2DPerception:
 
     def process_scan(self, msg):
         """
-        LaserScan mesajını işle.
-        msg yapısı Gazebo LaserScan protobuf'a uygun olmalı.
+        Process a LaserScan message.
+        msg structure must match Gazebo LaserScan protobuf.
         """
         try:
             ranges        = list(msg.ranges)
@@ -328,13 +321,13 @@ class Lidar2DPerception:
                 self._obstacles = new_obs
 
             if new_obs:
-                print(f"[lidar] {len(new_obs)} engel tespit edildi: "
+                print(f"[lidar] {len(new_obs)} obstacle(s) detected: "
                       + ", ".join(f"r={o[1]:.2f}m" for o in new_obs))
         except Exception as e:
-            print(f"[lidar] scan işleme hatası: {e}")
+            print(f"[lidar] scan processing error: {e}")
 
     def start(self):
-        """gz-transport subscriber başlat."""
+        """Start gz-transport subscriber."""
         try:
             import gz.transport13 as gz_t
             node = gz_t.Node()
@@ -342,10 +335,10 @@ class Lidar2DPerception:
             node.subscribe(self.topic, self.process_scan, LaserScan)
             self._subscriber = node
             self._running = True
-            print(f"[perception] Lidar2D başlatıldı — topic: {self.topic}")
+            print(f"[perception] Lidar2D started — topic: {self.topic}")
         except ImportError:
-            print("[perception] gz.transport bulunamadı — Lidar2D çalışmıyor")
-            print("[perception]   → GazeboGroundTruth veya StaticObstacles kullan")
+            print("[perception] gz.transport not found — Lidar2D not operational")
+            print("[perception]   -> Use GazeboGroundTruth or StaticObstacles instead")
 
     def stop(self):
         self._running = False
@@ -356,19 +349,19 @@ class Lidar2DPerception:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LEVEL 3 — STATİK ENGELLERİ ELLE TANIMLA
-#  En basit, en güvenilir. Bilinen ortamlarda production kullanımı için.
+#  LEVEL 3 — STATIC OBSTACLES (manually defined)
+#  Simplest, most reliable. For known environments.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class StaticObstacles:
     """
-    Sabit engeller — world dosyasındaki pozisyonlar elle girilir.
-    Perception sensörü gerekmez.
+    Fixed obstacles — positions entered manually from world file.
+    No perception sensor needed.
 
-    Örnek:
+    Example:
         static = StaticObstacles([
-            {'pos': [2.0, 0.0, 1.5], 'radius': 0.4, 'name': 'silindir_1'},
-            {'pos': [4.0, 1.0, 1.0], 'radius': 0.3, 'name': 'kutu_1'},
+            {'pos': [2.0, 0.0, 1.5], 'radius': 0.4, 'name': 'cylinder_1'},
+            {'pos': [4.0, 1.0, 1.0], 'radius': 0.3, 'name': 'box_1'},
         ])
     """
 
@@ -379,36 +372,39 @@ class StaticObstacles:
                 p = np.array(obs['pos'], dtype=float)
                 r = float(obs['radius'])
                 self._obstacles.append((p, r))
-        print(f"[perception] StaticObstacles: {len(self._obstacles)} engel yüklendi")
+        print(f"[perception] StaticObstacles: {len(self._obstacles)} obstacle(s) loaded")
 
     def start(self): pass
     def stop(self):  pass
 
     def add(self, x, y, z, radius):
         self._obstacles.append((np.array([x, y, z]), float(radius)))
-        print(f"[perception] Engel eklendi: ({x:.2f},{y:.2f},{z:.2f}) r={radius:.2f}m")
+        print(f"[perception] Obstacle added: ({x:.2f},{y:.2f},{z:.2f}) r={radius:.2f}m")
 
     def remove(self, idx):
         if 0 <= idx < len(self._obstacles):
             self._obstacles.pop(idx)
+
+    def clear(self):
+        self._obstacles.clear()
 
     def get_obstacles(self) -> List[Obstacle]:
         return list(self._obstacles)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PERCEPTION MANAGER — tek arayüz
+#  PERCEPTION MANAGER — unified interface
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PerceptionManager:
     """
-    quadrotor_mpc_client.py'deki _run_loop için tek noktalı arayüz.
+    Single-point interface for _run_loop in quadrotor_mpc_client.py.
 
-    level=1 → GazeboGroundTruth (gz CLI/transport)
-    level=2 → Lidar2DPerception
-    level=3 → StaticObstacles
+    level=1 -> GazeboGroundTruth (gz CLI/transport)
+    level=2 -> Lidar2DPerception
+    level=3 -> StaticObstacles
 
-    Örnek kullanım:
+    Example usage:
         perception = PerceptionManager(
             level=1,
             obstacle_models=[('obstacle_cylinder', 0.35),
@@ -416,7 +412,7 @@ class PerceptionManager:
         )
         perception.start()
         ...
-        obstacles = perception.get_obstacles()   # _run_loop'a geç
+        obstacles = perception.get_obstacles()   # pass to _run_loop
     """
 
     def __init__(self, level: int = 3, **kwargs):
@@ -438,7 +434,7 @@ class PerceptionManager:
             obs = kwargs.get('obstacles', [])
             self._backend = StaticObstacles(obs)
 
-        print(f"[PerceptionManager] Level {level} aktif")
+        print(f"[PerceptionManager] Level {level} active")
 
     def start(self):
         self._backend.start()
@@ -450,11 +446,10 @@ class PerceptionManager:
         return self._backend.get_obstacles()
 
     def update_drone_pos(self, pos: np.ndarray):
-        """Lidar2D için drone pozisyonunu güncelle."""
+        """Update drone position for Lidar2D transform."""
         if hasattr(self._backend, 'update_drone_pos'):
             self._backend.update_drone_pos(pos)
 
-    # Statik engel yönetimi (level=3)
     def add_static(self, x, y, z, r):
         if hasattr(self._backend, 'add'):
             self._backend.add(x, y, z, r)
@@ -462,3 +457,8 @@ class PerceptionManager:
     def remove_static(self, idx):
         if hasattr(self._backend, 'remove'):
             self._backend.remove(idx)
+
+    def clear_obstacles(self):
+        if hasattr(self._backend, 'clear'):
+            self._backend.clear()
+            print("[perception] All obstacles cleared")

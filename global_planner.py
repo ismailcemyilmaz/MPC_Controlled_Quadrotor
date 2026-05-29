@@ -334,3 +334,254 @@ class WaypointTrajectory:
     def is_complete(self, t_now, tol=0.1):
         """True when t_now is within tol seconds of trajectory end."""
         return float(t_now) >= self._T_total - tol
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKFLIP TRAJECTORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _quintic_s(tau):
+    """Quintic interpolant s(tau) for tau in [0,1]. s=0→0, s=1→1, s'=s''=0 at endpoints."""
+    return 10*tau**3 - 15*tau**4 + 6*tau**5
+
+def _quintic_ds(tau, T):
+    """First derivative ds/dt = ds/dtau / T."""
+    return (30*tau**2 - 60*tau**3 + 30*tau**4) / T
+
+def _quintic_dds(tau, T):
+    """Second derivative d²s/dt²."""
+    return (60*tau - 180*tau**2 + 120*tau**3) / (T*T)
+
+
+class BackflipTrajectory:
+    """
+    Full-state reference trajectory for a backflip (360° pitch rotation).
+
+    Timeline:
+        [0, T_pre)          : hold at start position (build up MPC warm-start)
+        [T_pre, T_pre+T_up) : vertical pop-up to gain upward velocity
+        [T_pre+T_up, T_pre+T_up+T_flip) : 360° pitch rotation, ballistic arc
+        [T_pre+T_up+T_flip, T_total)     : recovery hover at end position
+
+    The flip phase uses a quintic angle profile for smooth angular jerk.
+    Position during flip follows a ballistic arc (free-fall with optional
+    partial thrust from the rotating body frame).
+
+    Same interface as WaypointTrajectory: state_at(), get_horizon(), total_duration().
+    """
+
+    def __init__(self, start_pos, T_flip=0.8, T_pre=1.0, T_up=0.5, T_post=3.0,
+                 pop_up_vel=4.0):
+        self._start = np.array(start_pos, dtype=float)
+        self._T_up = T_up
+        self._T_flip = T_flip
+        self._T_total = T_pre + T_up + T_flip + T_post
+
+        self._t1 = T_pre                       # pop-up start
+        self._t2 = T_pre + T_up                # flip start
+        self._t3 = T_pre + T_up + T_flip       # recovery start
+
+        # Pop-up endpoint: quintic moves z from start to start + dz_up
+        self._dz_up = pop_up_vel * T_up * 0.5
+        self._vz_up = pop_up_vel
+
+        # Flip endpoint: ballistic from (z_flip_start, vz_up)
+        z_fs = self._start[2] + self._dz_up
+        self._z_flip_start = z_fs
+        self._z_flip_end = z_fs + self._vz_up * T_flip - 0.5 * G * T_flip**2
+        self._vz_flip_end = self._vz_up - G * T_flip
+
+        # Recovery target
+        self._z_recover = max(self._start[2], self._z_flip_end)
+
+    def total_duration(self):
+        return self._T_total
+
+    def state_at(self, t):
+        t = np.clip(float(t), 0.0, self._T_total)
+        x0, y0, z0 = self._start
+
+        if t < self._t1:
+            return np.array([x0, y0, z0, 0,0,0, 1,0,0,0, 0,0,0])
+
+        elif t < self._t2:
+            # Pop-up: quintic position profile, upright attitude
+            tau = (t - self._t1) / self._T_up
+            s = _quintic_s(tau)
+            ds = _quintic_ds(tau, self._T_up)
+            z = z0 + self._dz_up * s
+            vz = self._dz_up * ds
+            return np.array([x0, y0, z, 0, 0, vz, 1,0,0,0, 0,0,0])
+
+        elif t < self._t3:
+            # Flip: ballistic arc + 360° pitch rotation (quintic angle)
+            dt = t - self._t2
+            tau = dt / self._T_flip
+
+            z = self._z_flip_start + self._vz_up * dt - 0.5 * G * dt**2
+            vz = self._vz_up - G * dt
+
+            theta = 2.0 * np.pi * _quintic_s(tau)
+            dtheta = 2.0 * np.pi * _quintic_ds(tau, self._T_flip)
+
+            qw = np.cos(theta / 2.0)
+            qy = np.sin(theta / 2.0)
+
+            return np.array([x0, y0, z, 0, 0, vz, qw, 0, qy, 0, 0, dtheta, 0])
+
+        else:
+            # Recovery: smooth convergence to hover at z_recover
+            dt = t - self._t3
+            T_conv = 1.5
+            tau = min(dt / T_conv, 1.0)
+            s = _quintic_s(tau)
+
+            z = self._z_flip_end * (1.0 - s) + self._z_recover * s
+            vz = self._vz_flip_end * (1.0 - s)
+
+            return np.array([x0, y0, z, 0, 0, vz, 1,0,0,0, 0,0,0])
+
+    def get_horizon(self, t_now, N, Ts):
+        return np.array([self.state_at(t_now + k * Ts) for k in range(N + 1)])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  APF TRAJECTORY — Artificial Potential Field path planning
+# ══════════════════════════════════════════════════════════════════════════════
+
+class APFTrajectory:
+    """
+    Artificial Potential Field trajectory from start to goal through obstacles.
+
+    Generates a smooth path offline by integrating the APF gradient, then
+    fits quintic polynomials for velocity/acceleration continuity.
+
+    Same interface as WaypointTrajectory: state_at(), get_horizon(), total_duration().
+
+    Parameters
+    ----------
+    start     : [x, y, z]  start position
+    goal      : [x, y, z]  goal position
+    obstacles : [(pos, radius), ...]  list of (np.array(3,), float)
+    k_att     : attractive gain
+    k_rep     : repulsive gain
+    d0        : repulsive influence distance [m]
+    max_vel   : max velocity along path [m/s]
+    R_drone   : drone collision radius [m]
+    step_size : integration step [m]
+    """
+
+    def __init__(self, start, goal, obstacles,
+                 k_att=1.0, k_rep=0.8, d0=2.5,
+                 max_vel=1.5, R_drone=0.35, step_size=0.05):
+        self._start = np.array(start, dtype=float)
+        self._goal  = np.array(goal, dtype=float)
+
+        path = self._plan_path(
+            self._start, self._goal, obstacles,
+            k_att, k_rep, d0, R_drone, step_size)
+
+        waypoints = []
+        for i, p in enumerate(path):
+            if i == 0 or i == len(path) - 1:
+                waypoints.append({'pos': p, 'vel': [0, 0, 0]})
+            else:
+                direction = path[i + 1] - path[i - 1]
+                d = np.linalg.norm(direction)
+                if d > 1e-6:
+                    vel = direction / d * max_vel * 0.6
+                else:
+                    vel = np.zeros(3)
+                waypoints.append({'pos': p, 'vel': vel})
+
+        self._traj = WaypointTrajectory(waypoints, max_vel=max_vel)
+
+        min_dists = []
+        for obs_pos, obs_r in obstacles:
+            dists = [np.linalg.norm(p[:2] - obs_pos[:2]) for p in path]
+            min_dists.append((np.min(dists), obs_r))
+
+        print(f"[APF] {len(path)} waypoints, {self._traj.total_duration():.1f}s")
+        for i, (md, r) in enumerate(min_dists):
+            print(f"  obs{i+1}: min_dist={md:.2f}m  (r={r:.1f}, safe={r+R_drone:.2f})")
+
+    @staticmethod
+    def _plan_path(start, goal, obstacles, k_att, k_rep, d0, R_drone, step_size):
+        pos = start.copy()
+        alt = goal[2]
+        path = [pos.copy()]
+        max_steps = 5000
+        goal_tol = 0.3
+
+        line_dir = goal[:2] - start[:2]
+        obs_signs = []
+        for obs_pos, obs_r in obstacles:
+            obs_off = obs_pos[:2] - start[:2]
+            cross = line_dir[0] * obs_off[1] - line_dir[1] * obs_off[0]
+            obs_signs.append(+1 if cross >= 0 else -1)
+            side = "left" if cross > 0 else ("right" if cross < 0 else "center")
+            print(f"  obs({obs_pos[0]:.0f},{obs_pos[1]:.0f}): {side} of line -> pass {'right' if cross >= 0 else 'left'}")
+
+        for _ in range(max_steps):
+            if np.linalg.norm(pos[:2] - goal[:2]) < goal_tol:
+                break
+
+            diff_goal = goal[:2] - pos[:2]
+            f_att = k_att * diff_goal
+            f_att_norm = np.linalg.norm(f_att)
+            if f_att_norm > k_att:
+                f_att = f_att / f_att_norm * k_att
+
+            f_rep = np.zeros(2)
+            for idx, (obs_pos, obs_r) in enumerate(obstacles):
+                diff = pos[:2] - obs_pos[:2]
+                dist = np.linalg.norm(diff)
+                margin = dist - obs_r - R_drone
+                if margin < d0 and margin > 0.01:
+                    strength = k_rep * (1.0/margin - 1.0/d0) * (1.0/margin**2)
+                    radial = diff / dist
+                    sign = obs_signs[idx]
+                    tangent = sign * np.array([-diff[1], diff[0]]) / dist
+                    f_rep += strength * (radial + 0.5 * tangent)
+                elif margin <= 0.01:
+                    f_rep += k_rep * 100.0 * (diff / max(dist, 0.01))
+
+            f_total = f_att + f_rep
+            f_norm = np.linalg.norm(f_total)
+            if f_norm < 1e-6:
+                f_total = f_att + np.array([0.0, 0.1])
+
+            direction = f_total / np.linalg.norm(f_total)
+            pos[:2] = pos[:2] + step_size * direction
+            pos[2] = alt
+            path.append(pos.copy())
+
+        path.append(goal.copy())
+
+        raw_len = len(path)
+        ys = [p[1] for p in path]
+        print(f"[APF] raw path: {raw_len} pts, y range [{min(ys):.2f}, {max(ys):.2f}]")
+
+        path = APFTrajectory._downsample(path, min_dist=2.0)
+        return path
+
+    @staticmethod
+    def _downsample(path, min_dist=0.5):
+        result = [path[0]]
+        for p in path[1:-1]:
+            if np.linalg.norm(p - result[-1]) >= min_dist:
+                result.append(p)
+        result.append(path[-1])
+        return result
+
+    def state_at(self, t):
+        return self._traj.state_at(t)
+
+    def get_horizon(self, t_now, N, Ts):
+        return self._traj.get_horizon(t_now, N, Ts)
+
+    def total_duration(self):
+        return self._traj.total_duration()
+
+    def initial_state(self):
+        return self._traj.initial_state()

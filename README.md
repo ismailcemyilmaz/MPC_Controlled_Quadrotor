@@ -37,6 +37,8 @@ Input  u ∈ R^4   :  [f_total, τx, τy, τz]
 | `perception.py` | PerceptionManager (Gazebo GT / 2D Lidar / Static) |
 | `quadrotor_mpc_client_v3.py` | Main control loop and public API |
 | `plot_mpc_log.py` | Log visualization and auto-save to `plots/` |
+| `plot_backflip_paper.py` | Paper-ready backflip analysis plots |
+| `plot_apf_field.py` | APF force field + potential visualization |
 
 **Features:**
 
@@ -113,11 +115,14 @@ mpc-quadrotor/
 ├── perception.py                # PerceptionManager (3 levels)
 ├── plot_mpc_log.py              # Log visualizer (auto-saves to plots/)
 ├── plot_apf_field.py            # APF force field + potential visualization
+├── plot_backflip.py             # Backflip analysis plots (detailed)
+├── plot_backflip_paper.py       # Backflip paper-ready plots (single column)
 ├── simulation.sh                # Basic simulation stack (no obstacles)
 ├── simulation_obstacles.sh      # Obstacle avoidance simulation stack
 ├── worlds/
 │   ├── quad.world               # Empty world
-│   └── quad_obstacles.world     # 3 cylindrical obstacles
+│   ├── quad_obstacles.world     # 3 cylindrical obstacles
+│   └── quad_obstacles_dense.world  # 5-obstacle alternating slalom
 ├── model/
 │   ├── mrsim-quadrotor-lidar/
 │   │   ├── model.sdf            # Quadrotor with Lidar (+ configuration)
@@ -206,8 +211,11 @@ cd ~/tk3lab-ws/src/mpc-quadrotor
 # Basic (no obstacles):
 bash simulation.sh
 
-# Obstacle world:
+# 3-obstacle world:
 bash simulation_obstacles.sh
+
+# 5-obstacle dense slalom:
+bash simulation_obstacles.sh worlds/quad_obstacles_dense.world
 ```
 
 ### Terminal 2 — Python Control
@@ -235,12 +243,18 @@ python3 -i quadrotor_mpc_client_v3.py
 ### Obstacle Avoidance — Reactive APF (recommended)
 
 ```python
-# Use simulation_obstacles.sh world
+# 3-obstacle world (simulation_obstacles.sh):
 >>> setup()
 >>> slalom_reactive()
+
+# 5-obstacle dense world with lidar perception:
+>>> setup(perception_level=2)
+>>> slalom_reactive(use_perception=True, max_vel=2.5)
 ```
 
-Real-time APF at each MPC step. No pre-planned waypoints — drone reacts to obstacles online. Same architecture extends to lidar-based perception.
+Real-time APF at each MPC step. No pre-planned waypoints — drone reacts to obstacles online.
+
+With `use_perception=True`, obstacles are detected via 2D lidar (LaserScan → DBSCAN clustering → nearest-neighbor data association) instead of hardcoded positions. Requires `perception_level=2` in `setup()` to enable lidar-based perception.
 
 ### Obstacle Avoidance — Offline APF
 
@@ -257,15 +271,30 @@ Pre-plans full path with APF, fits quintic polynomials, MPC tracks. Faster but l
 ```python
 # Use simulation.sh (no obstacles, needs altitude clearance)
 >>> setup()
->>> backflip(alt=10.0)
+>>> backflip()          # basic version
+>>> backflip_ilc()      # tuned version with PD position-feedback recovery
 ```
 
 Lupashin 5-phase bang-coast-bang backflip:
-1. MPC climb to altitude and hover
-2. Open-loop pop-up impulse (vertical velocity)
-3. Open-loop flip: accel(+τ) → coast(freefall) → decel(-τ)
-4. Rate-kill phase (angular rate damping to <0.5 rad/s)
-5. MPC recovery with boosted attitude gains
+1. MPC climb to 10m and hover
+2. Open-loop pop-up impulse (2.0×mg for 0.40s)
+3. Open-loop flip: accel(+τ) → coast(freefall) → decel(-τ), body-rate integrated angle tracking with dynamic decel start
+4. SO(3) quaternion-based recovery with velocity + position damping
+5. MPC return to origin and landing
+
+`backflip_ilc()` uses tuned parameters (f_accel=8.77N, f_decel=8.81N) and adds position feedback (K_pos=0.05) to the SO(3) recovery phase, pulling the drone back toward its pre-flip hover position.
+
+**Typical results (good flip exit, qw > 0.95):**
+
+| Metric | Value |
+| --- | --- |
+| Flip duration | ~0.75s |
+| Peak pitch rate | ~9.3 rad/s |
+| Attitude error at exit | 14–24° |
+| Max lateral drift | 2–3m |
+| Settled drift | 0.5–0.8m |
+| Altitude loss | 0.5–1.0m |
+| Recovery time | 3–5s |
 
 ### Manual Control
 
@@ -314,7 +343,9 @@ F_rep = k_rep × (1/margin - 1/d0) × (1/margin²) × (radial + 0.5 × tangent)
 
 Tangent direction per obstacle: `sign(cross(line_dir, obs_offset))` — obstacle left of start→goal line → pass right, and vice versa. Creates natural slalom pattern.
 
-### World Layout (`quad_obstacles.world`)
+### World Layouts
+
+**Original (`quad_obstacles.world`) — 3 obstacles:**
 
 ```
                        obs2(6, 1.5)
@@ -322,19 +353,34 @@ Start(0,0)  →  obs1(3,0)  ────────────────  ob
                  🔴 r=0.4      🟠 r=0.4        🔵 r=0.4
 ```
 
-Three cylindrical obstacles (radius=0.4m, height=3m).
+**Dense (`quad_obstacles_dense.world`) — 5 obstacles, alternating slalom:**
+
+```
+     y
+ 1.5┊       ○2(6)          ○4(12)
+    ┊
+  0 ─S┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄G(18,0)→ x
+    ┊
+-1.5┊    ○1(3)       ○3(9)        ○5(15)
+    ┊
+    0  3  6  9  12  15  18
+```
+
+All obstacles: radius=0.4m, height=3.0m. Obstacles alternate y=±1.5 to force zigzag weaving. Margin = 1.5 - 0.4 - 0.5 = 0.60m per side.
 
 ### APF Parameters
 
-| Parameter | Reactive | Offline |
+| Parameter | Original (3-obs) | Dense (5-obs) |
 | --- | --- | --- |
 | k_att | 1.0 | 1.0 |
 | k_rep | 0.8 | 0.8 |
 | d0 | 2.5 m | 2.5 m |
-| R_drone (APF) | 0.65 m | 0.65 m |
-| max_vel | 2.5 m/s | 1.0 m/s |
+| R_drone (APF) | 0.65 m | 0.50 m |
+| tangent_weight | 0.5 | 0.5 |
+| max_vel | 2.5 m/s | 2.5 m/s |
+| goal | (12, 0) | (18, 0) |
 
-### Reactive Slalom Results
+### Reactive Slalom Results — Original World
 
 | Metric | Value |
 | --- | --- |
@@ -348,13 +394,36 @@ Three cylindrical obstacles (radius=0.4m, height=3m).
 | Torque saturation | 49% |
 | qw min | 0.987 (stable) |
 
+### Reactive Slalom Results — Dense World (Lidar Perception)
+
+| Metric | Value |
+| --- | --- |
+| Duration | ~25s |
+| Obstacles | 5 (detected via 2D lidar) |
+| Avg speed | 1.28 m/s |
+| Obstacle margins | 0.9–1.9m |
+| Perception | DBSCAN clustering + nearest-neighbor association |
+
+### Perception Pipeline (Lidar Mode)
+
+```
+LaserScan (360° 2D) → Polar-to-Cartesian → DBSCAN Clustering → (position, radius)
+                                                ↓
+                               Nearest-Neighbor Data Association (1.5m threshold)
+                                                ↓
+                                    APF Sign Stability (cross-product)
+```
+
+Filtering: radius > 1.0m rejected, obstacles behind drone (x < drone_x - 1.5) ignored, |y| > 5.0m rejected.
+
 ### Visualization
 
 APF force field and potential surface visualization:
 
 ```bash
-python3 plot_apf_field.py                                    # reactive log
-python3 plot_apf_field.py logs/mpc/slalom/mpc_log.npz       # offline log
+python3 plot_apf_field.py                                         # dense world, lidar log
+python3 plot_apf_field.py --world original                        # original 3-obstacle world
+python3 plot_apf_field.py logs/mpc/slalom/mpc_log.npz --world original  # offline log
 ```
 
 ---

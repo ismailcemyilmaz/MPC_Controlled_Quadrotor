@@ -8,7 +8,7 @@ set -e
 
 middleware=pocolibs
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-world="${SCRIPT_DIR}/worlds/quad_obstacles.world"
+world="${1:-${SCRIPT_DIR}/worlds/quad_obstacles.world}"
 
 export GZ_SIM_RESOURCE_PATH="${SCRIPT_DIR}/model:${GZ_SIM_RESOURCE_PATH:-}"
 

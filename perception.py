@@ -69,7 +69,7 @@ class GazeboGroundTruth:
     def _detect_method(self):
         """Determine which gz interface is available."""
         # 1. gz-transport Python binding
-        for ver in [13, 12, 11, 10]:
+        for ver in [14, 13, 12, 11, 10]:
             try:
                 mod = __import__(f'gz.transport{ver}')
                 self._gz_transport = mod
@@ -232,12 +232,14 @@ class Lidar2DPerception:
         """Update drone position each step (for LaserScan transform)."""
         self._drone_pos = pos.copy()
 
-    def _polar_to_cartesian(self, ranges, angle_min, angle_increment):
+    def _polar_to_cartesian(self, ranges, angle_min, angle_increment,
+                            max_range_override=None):
         """LaserScan polar -> world frame cartesian points."""
         points = []
         dx, dy = self._drone_pos[0], self._drone_pos[1]
+        mr = max_range_override if max_range_override else self.max_range
         for i, r in enumerate(ranges):
-            if r < 0.1 or r > self.max_range:
+            if r < 0.1 or r > mr:
                 continue
             angle = angle_min + i * angle_increment
             x = dx + r * math.cos(angle)
@@ -304,11 +306,17 @@ class Lidar2DPerception:
         msg structure must match Gazebo LaserScan protobuf.
         """
         try:
+            if self._drone_pos[2] < 1.5:
+                return
+
             ranges        = list(msg.ranges)
             angle_min     = msg.angle_min
             angle_increment = msg.angle_step
 
-            pts = self._polar_to_cartesian(ranges, angle_min, angle_increment)
+            max_r = min(self.max_range, self._drone_pos[2] * 3.0)
+
+            pts = self._polar_to_cartesian(ranges, angle_min, angle_increment,
+                                           max_range_override=max_r)
             if len(pts) < self.cluster_min:
                 return
 
@@ -317,10 +325,11 @@ class Lidar2DPerception:
                 clusters, self._drone_pos[2]
             )
 
+            prev_count = len(self._obstacles)
             with self._lock:
                 self._obstacles = new_obs
 
-            if new_obs:
+            if len(new_obs) != prev_count:
                 print(f"[lidar] {len(new_obs)} obstacle(s) detected: "
                       + ", ".join(f"r={o[1]:.2f}m" for o in new_obs))
         except Exception as e:
@@ -328,17 +337,44 @@ class Lidar2DPerception:
 
     def start(self):
         """Start gz-transport subscriber."""
-        try:
-            import gz.transport13 as gz_t
-            node = gz_t.Node()
-            from gz.msgs.laserscan_pb2 import LaserScan
-            node.subscribe(self.topic, self.process_scan, LaserScan)
-            self._subscriber = node
-            self._running = True
-            print(f"[perception] Lidar2D started — topic: {self.topic}")
-        except ImportError:
+        gz_t = None
+        for ver in [14, 13, 12, 11, 10]:
+            try:
+                gz_t = __import__(f'gz.transport{ver}')
+                gz_t = getattr(gz_t, f'transport{ver}')
+                print(f"[perception] gz.transport{ver} found for Lidar2D")
+                break
+            except (ImportError, AttributeError):
+                pass
+
+        if gz_t is None:
             print("[perception] gz.transport not found — Lidar2D not operational")
             print("[perception]   -> Use GazeboGroundTruth or StaticObstacles instead")
+            return
+
+        from gz.msgs11.laserscan_pb2 import LaserScan
+        self._LaserScan = LaserScan
+
+        def _raw_cb(raw_msg):
+            try:
+                scan = self._LaserScan()
+                scan.ParseFromString(raw_msg)
+                self.process_scan(scan)
+            except Exception as e:
+                print(f"[lidar] parse error: {e}")
+
+        try:
+            node = gz_t.Node()
+            ok = node.subscribe(LaserScan, self.topic, self.process_scan)
+            if ok:
+                self._subscriber = node
+                self._running = True
+                print(f"[perception] Lidar2D started — topic: {self.topic}")
+            else:
+                print(f"[perception] Lidar2D subscribe returned False — topic may not exist")
+        except Exception as e:
+            print(f"[perception] Lidar2D subscribe failed: {e}")
+            print("[perception]   -> Check if Gazebo is running and lidar topic exists")
 
     def stop(self):
         self._running = False

@@ -59,13 +59,17 @@ _LOCAL_MPC_KWARGS = dict(
 )
 
 # ── Perception configuration ────────────────────────────────────────────────
-OBSTACLE_MODELS = []
+OBSTACLE_MODELS = [
+    ('obstacle_1', 0.4),
+    ('obstacle_2', 0.4),
+    ('obstacle_3', 0.4),
+]
 
 # ── Flight parameters ───────────────────────────────────────────────────────
 GROUND_Z        = 0.10
 MAX_VEL         = 1.5
 MIN_SAFE_Z      = 1.5
-DESCENT_VEL     = 0.40   # landing descent speed [m/s]
+DESCENT_VEL     = 0.30   # landing descent speed [m/s]
 LAND_XY_RADIUS  = 0.50   # obstacle search radius [m]
 LAND_MARGIN     = 0.05   # safety clearance above obstacle [m]
 
@@ -213,17 +217,21 @@ def _build_land_traj(curr_pos, land_z, descent_vel=DESCENT_VEL):
 
 # ── Control loop ─────────────────────────────────────────────────────────────
 def _run_loop(traj: WaypointTrajectory,
-              T_total: float) -> None:
+              T_total: float,
+              ground_cutoff: bool = False) -> None:
     """
     MPC control loop.
 
     When trajectory ends (t > traj.total_duration()), reference freezes at
     the final point — drone hovers at target. Returns after T_total elapsed.
 
+    If ground_cutoff=True, exits early when z < GROUND_Z and descending.
+
     Log data written to module-level _session; does not save to disk.
     """
     t_start    = time.time()
     t_next_mpc = t_start
+    f_min_safe = 0.60 * MASS * G
 
     T_traj = traj.total_duration()
 
@@ -235,6 +243,11 @@ def _run_loop(traj: WaypointTrajectory,
         t_ref = min(t_now, T_traj)
 
         x_now     = _current_state()
+
+        if ground_cutoff and x_now[2] < GROUND_Z and x_now[5] <= 0:
+            print(f"[landing] ground contact — z={x_now[2]:.3f}m")
+            break
+
         x_ref_now = traj.state_at(t_ref)
 
         t_global = time.time() - _session_t0
@@ -254,6 +267,9 @@ def _run_loop(traj: WaypointTrajectory,
             xref_h      = traj.get_horizon(t_ref, MPC_N, MPC_TS)
             u_opt, info = _mpc.solve(x_now, xref_h, obstacles=obstacles,
                                      sign_correct=not _flip_mode)
+
+            if u_opt[0] < f_min_safe:
+                u_opt[0] = f_min_safe
 
             if _session:
                 _session['u'].append(u_opt.copy())
@@ -277,7 +293,7 @@ def _run_loop(traj: WaypointTrajectory,
 # PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def setup(perception_level: int = 1):
+def setup(perception_level: int = 3):
     global _g, _pom, _rotorcraft, _optitrack, _mpc, _perception
 
     assert GENOMIX_AVAILABLE, "genomix not available"
@@ -424,9 +440,8 @@ def landing(descent_vel: float = DESCENT_VEL,
         print(f"\n[landing] No obstacles below — landing at ground (z=0)")
 
     # ── Descent trajectory ───────────────────────────────────────────────────
-    _mpc.reset(x_now)
     traj, T_descend = _build_land_traj(curr_pos, land_z, descent_vel)
-    T_total         = T_descend + 1.0
+    T_total         = T_descend + 2.0
 
     print(f"[landing] current z={curr_pos[2]:.2f}m  "
           f"target z={land_z:.2f}m  duration~{T_descend:.1f}s")
@@ -434,7 +449,7 @@ def landing(descent_vel: float = DESCENT_VEL,
     if not _session:
         _session_open('landing_only')
 
-    _run_loop(traj, T_total)
+    _run_loop(traj, T_total, ground_cutoff=True)
 
     # ── Stop motors and save log ─────────────────────────────────────────────
     _rotorcraft.stop()
@@ -659,10 +674,13 @@ def _apf_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel):
             pos[:2] = goal_2d
         else:
             f = _apf_force_2d(pos[:2], goal_2d, obstacles,
-                              R_drone=0.65, obs_signs=obs_signs)
+                              R_drone=0.50, obs_signs=obs_signs)
             f_norm = np.linalg.norm(f)
             direction = f / f_norm if f_norm > 1e-6 else np.array([1.0, 0.0])
-            speed = min(max_vel, max_vel * dist_to_goal / 2.0)
+            if direction[0] < 0.1:
+                direction[0] = 0.1
+                direction = direction / np.linalg.norm(direction)
+            speed = min(max_vel, max_vel * dist_to_goal / 1.0)
             vel = np.array([direction[0] * speed, direction[1] * speed, 0.0])
 
         xref[k, 0:3] = pos
@@ -680,37 +698,48 @@ def _apf_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel):
 def slalom_reactive(alt: float = 2.0,
                     max_vel: float = 2.5,
                     T_timeout: float = 40.0,
-                    goal_tol: float = 0.5) -> None:
+                    goal_tol: float = 0.5,
+                    use_perception: bool = False) -> None:
     """
     Real-time APF obstacle avoidance — no pre-planned waypoints.
 
     At each MPC step, APF computes velocity reference from current position.
-    MPC tracks this reactive reference. Same architecture works with lidar.
+    MPC tracks this reactive reference.
+
+    use_perception=False: hardcoded obstacles (default, tested)
+    use_perception=True:  read obstacles from PerceptionManager (lidar/GT)
 
         >>> setup()
-        >>> slalom_reactive()
+        >>> slalom_reactive()                        # hardcoded
+        >>> slalom_reactive(use_perception=True)     # perception
     """
     assert _perception is not None, "Call setup() first"
 
-    obstacles = []
-    for ox, oy, oz, r in _SLALOM_OBSTACLES:
-        obstacles.append((np.array([ox, oy, oz]), r))
-
-    goal_pos = np.array([12.0, 0.0, alt])
+    goal_pos = np.array([18.0, 0.0, alt])
     start_pos = np.array([0.0, 0.0, alt])
-
     line_dir = goal_pos[:2] - start_pos[:2]
-    obs_signs = []
-    for obs_pos, obs_r in obstacles:
-        obs_off = obs_pos[:2] - start_pos[:2]
-        cross = line_dir[0] * obs_off[1] - line_dir[1] * obs_off[0]
-        obs_signs.append(+1 if cross >= 0 else -1)
-        side = "left" if cross > 0 else ("right" if cross < 0 else "center")
-        print(f"  obs({obs_pos[0]:.0f},{obs_pos[1]:.0f}): {side} -> pass {'right' if cross >= 0 else 'left'}")
 
-    print(f"[slalom_reactive] {len(obstacles)} obstacles, goal=({goal_pos[0]},{goal_pos[1]},{goal_pos[2]}), max_vel={max_vel}")
+    if use_perception:
+        print(f"[slalom_reactive] PERCEPTION mode — obstacles from PerceptionManager")
+        obstacles = []
+        obs_signs = []
+        _known_obs = []
+    else:
+        obstacles = []
+        for ox, oy, oz, r in _SLALOM_OBSTACLES:
+            obstacles.append((np.array([ox, oy, oz]), r))
+        obs_signs = []
+        for obs_pos, obs_r in obstacles:
+            obs_off = obs_pos[:2] - start_pos[:2]
+            cross = line_dir[0] * obs_off[1] - line_dir[1] * obs_off[0]
+            obs_signs.append(+1 if cross >= 0 else -1)
+            side = "left" if cross > 0 else ("right" if cross < 0 else "center")
+            print(f"  obs({obs_pos[0]:.0f},{obs_pos[1]:.0f}): {side} -> pass {'right' if cross >= 0 else 'left'}")
 
-    _session_open('slalom_reactive')
+    print(f"[slalom_reactive] goal=({goal_pos[0]},{goal_pos[1]},{goal_pos[2]}), max_vel={max_vel}")
+
+    tag = 'slalom_reactive_lidar' if use_perception else 'slalom_reactive'
+    _session_open(tag)
     start()
 
     # Takeoff
@@ -744,11 +773,44 @@ def slalom_reactive(alt: float = 2.0,
         if dist_to_goal < goal_tol and not reached_goal:
             reached_goal = True
             t_goal = t_now
-            print(f"[slalom_reactive] Reached goal at t={t_now:.1f}s, holding 3s...")
+            print(f"[slalom_reactive] Reached goal at t={t_now:.1f}s, holding 1.5s...")
 
-        if reached_goal and t_now - t_goal > 3.0:
+        if reached_goal and t_now - t_goal > 1.5:
             print(f"[slalom_reactive] Hold complete.")
             break
+
+        # Update obstacles from perception
+        if use_perception:
+            _perception.update_drone_pos(x_now[:3])
+            perceived = _perception.get_obstacles()
+            obstacles = []
+            obs_signs = []
+            for obs_pos, obs_r in perceived:
+                if obs_r > 1.0:
+                    continue
+                if obs_pos[0] < x_now[0] - 1.5:
+                    continue
+                if abs(obs_pos[1]) > 5.0:
+                    continue
+
+                obstacles.append((obs_pos, obs_r))
+
+                matched_sign = None
+                for kpos, ksign in _known_obs:
+                    if np.linalg.norm(obs_pos[:2] - kpos) < 1.5:
+                        matched_sign = ksign
+                        break
+
+                if matched_sign is not None:
+                    obs_signs.append(matched_sign)
+                else:
+                    obs_off = obs_pos[:2] - start_pos[:2]
+                    cross = line_dir[0] * obs_off[1] - line_dir[1] * obs_off[0]
+                    sign = +1 if cross >= 0 else -1
+                    _known_obs.append((obs_pos[:2].copy(), sign))
+                    obs_signs.append(sign)
+                    side = "left" if cross > 0 else "right"
+                    print(f"  [perception] new obs({obs_pos[0]:.1f},{obs_pos[1]:.1f}) r={obs_r:.2f}: {side} -> pass {'right' if cross >= 0 else 'left'}")
 
         t_global = time.time() - _session_t0
 
@@ -777,11 +839,15 @@ def slalom_reactive(alt: float = 2.0,
         time.sleep(0.002)
 
     # Obstacle distances
-    if _session:
+    if _session and obstacles:
         xs = np.array(_session['x'])
         for i, (obs_pos, obs_r) in enumerate(obstacles):
             dists = np.sqrt((xs[:, 0] - obs_pos[0])**2 + (xs[:, 1] - obs_pos[1])**2)
             print(f"  obs{i+1}: min_dist={np.min(dists):.2f}m (safe={obs_r + 0.35:.2f}m)")
+
+    # Stop lidar before landing to avoid phantom obstacles during descent
+    if use_perception and hasattr(_perception, '_backend'):
+        _perception.stop()
 
     landing()
 
@@ -821,14 +887,15 @@ def backflip(alt: float = 10.0,
     alpha_nom = tau_flip / I_yy
 
     theta_accel_end = np.radians(45)
-    theta_decel_start = np.radians(270)
-    theta_done = np.radians(300)
+    theta_target = 2 * np.pi
+    theta_done_min = np.radians(340)
+    alpha_eff_decel = alpha_nom * 0.60
 
     print(f"[backflip] Lupashin 5-phase (bang-coast-bang):")
     print(f"  tau={tau_flip:.2f} Nm  alpha_nom={alpha_nom:.1f} rad/s²")
     print(f"  f_bang={f_bang:.1f}N  f_coast={f_coast:.1f}N (rotor idle)")
     print(f"  Quat-pitch tracking: accel→coast at {np.degrees(theta_accel_end):.0f}°, "
-          f"coast→decel at {np.degrees(theta_decel_start):.0f}°")
+          f"dynamic decel start")
 
     if alt < 5.0:
         print(f"[backflip] WARNING: need at least 5m altitude")
@@ -875,13 +942,13 @@ def backflip(alt: float = 10.0,
     x_popup = _current_state()
     print(f"[backflip] Post pop-up: z={x_popup[2]:.2f}m vz={x_popup[5]:.2f} m/s")
 
-    # Phase 3: flip with quaternion-based pitch tracking
+    # Phase 3: flip with body-rate integration
     print(f"[backflip] Phase 3: FLIP!")
     _flip_mode = True
 
     t_flip_start = time.time()
     t_global_base = time.time() - _session_t0
-    prev_pitch = _quat_pitch(_current_state())
+    prev_time = t_flip_start
     cumulative_pitch = 0.0
     phase = 'accel'
 
@@ -889,37 +956,31 @@ def backflip(alt: float = 10.0,
         now = time.time()
         x_now = _current_state()
 
-        curr_pitch = _quat_pitch(x_now)
-        d_pitch = curr_pitch - prev_pitch
-        if d_pitch > np.pi:
-            d_pitch -= 2 * np.pi
-        elif d_pitch < -np.pi:
-            d_pitch += 2 * np.pi
-        cumulative_pitch += d_pitch
-        prev_pitch = curr_pitch
-
+        dt = now - prev_time
+        prev_time = now
         q_rate = x_now[11]
+        cumulative_pitch += q_rate * dt
 
         if phase == 'accel' and cumulative_pitch >= theta_accel_end:
             phase = 'coast'
             print(f"[backflip]   -> coast at {np.degrees(cumulative_pitch):.0f}° "
                   f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
 
-        elif phase == 'coast' and cumulative_pitch >= theta_decel_start:
-            phase = 'decel'
-            print(f"[backflip]   -> decel at {np.degrees(cumulative_pitch):.0f}° "
-                  f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+        elif phase == 'coast' and q_rate > 0.1:
+            decel_angle = q_rate**2 / (2 * alpha_eff_decel)
+            remaining = theta_target - cumulative_pitch
+            if remaining <= decel_angle:
+                phase = 'decel'
+                print(f"[backflip]   -> decel at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  stop_dist={np.degrees(decel_angle):.0f}°  "
+                      f"t={now-t_flip_start:.3f}s")
 
         if phase == 'decel':
-            if cumulative_pitch >= theta_done and abs(q_rate) < 1.5:
+            if q_rate < 1.0:
                 print(f"[backflip]   -> done at {np.degrees(cumulative_pitch):.0f}° "
                       f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
                 break
-            if cumulative_pitch >= np.radians(300) and q_rate < -1.0:
-                print(f"[backflip]   -> over-braked at {np.degrees(cumulative_pitch):.0f}° "
-                      f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
-                break
-            if cumulative_pitch >= np.radians(420):
+            if cumulative_pitch >= np.radians(450):
                 print(f"[backflip]   -> overshoot at {np.degrees(cumulative_pitch):.0f}° "
                       f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
                 break
@@ -954,82 +1015,324 @@ def backflip(alt: float = 10.0,
     print(f"[backflip] Post-flip: z={x_after[2]:.2f}m  vz={x_after[5]:.2f}  "
           f"qw={x_after[6]:.3f}  pitch_rate={x_after[11]:.1f} rad/s")
 
-    # Phase 4a: open-loop rate kill (P-controller on pitch rate)
+    # Phase 4: SO(3) recovery with lateral velocity damping
+    # MPC doesn't converge after flip — SO(3) handles full recovery.
+    # Tilts against velocity to decelerate, not just level attitude.
     _flip_mode = False
-    print(f"[backflip] Phase 4a: rate kill")
-    K_rate = 0.04
-    t_rate_start = time.time()
-    while time.time() - t_rate_start < 0.8:
+    print(f"[backflip] Phase 4: SO3 recovery (attitude + velocity damping)")
+
+    Kp_att = 1.5
+    Kd_att = 1.2
+    K_vz   = 3.0
+    K_vxy  = 0.10
+    tau_budget = tau_flip
+
+    t_rec_start = time.time()
+    phase4_settled = False
+    while time.time() - t_rec_start < 6.0:
         x_now = _current_state()
-        q_rate = x_now[11]
-        p_rate = x_now[10]
-        r_rate = x_now[12]
+        omega = x_now[10:13]
+        vx, vy, vz = x_now[3], x_now[4], x_now[5]
 
-        tau_y = np.clip(-K_rate * q_rate, -tau_flip, tau_flip)
-        tau_x = np.clip(-K_rate * p_rate, -0.3, 0.3)
-        tau_z = np.clip(-0.02 * r_rate, -0.06, 0.06)
+        qw, qx, qy, qz = x_now[6], x_now[7], x_now[8], x_now[9]
+        if qw < 0:
+            qw, qx, qy, qz = -qw, -qx, -qy, -qz
 
-        pitch_err = _quat_pitch(x_now)
-        f_hold = MASS * G * max(np.cos(pitch_err), 0.3)
+        qx_des = np.clip(K_vxy * vy, -0.20, 0.20)
+        qy_des = np.clip(-K_vxy * vx, -0.20, 0.20)
 
-        wrench_to_rotorcraft(f_hold, tau_x, tau_y, tau_z)
+        q_err_vec = np.array([qx - qx_des, qy - qy_des, qz])
+        q_err_norm = np.linalg.norm(q_err_vec)
+        if q_err_norm > 1e-6:
+            theta_err = 2.0 * np.arctan2(q_err_norm, qw)
+            axis = q_err_vec / q_err_norm
+        else:
+            theta_err = 0.0
+            axis = np.array([0.0, 0.0, 1.0])
+
+        tau_vec = -Kp_att * theta_err * axis - Kd_att * omega
+        tau_vec[2] = np.clip(tau_vec[2], -0.1, 0.1)
+        tau_norm = np.linalg.norm(tau_vec)
+        if tau_norm > tau_budget:
+            tau_vec = tau_vec / tau_norm * tau_budget
+
+        f_up = MASS * G + np.clip(-K_vz * vz, -MASS * G, MASS * G)
+        f_cmd = np.clip(f_up, 0.5 * MASS * G, 2.0 * MASS * G)
+
+        wrench_to_rotorcraft(f_cmd, tau_vec[0], tau_vec[1], tau_vec[2])
 
         if _session:
             t_global = time.time() - _session_t0
             _session['t'].append(t_global)
             _session['x'].append(x_now.copy())
             _session['xref'].append(x_now.copy())
-            _session['u'].append(np.array([f_hold, tau_x, tau_y, tau_z]))
+            _session['u'].append(np.array([f_cmd, tau_vec[0], tau_vec[1], tau_vec[2]]))
             _session['mpc_ms'].append(0.0)
             _session['n_obs'].append(0)
 
-        if abs(q_rate) < 0.5 and abs(p_rate) < 0.5:
-            print(f"[backflip]   rates killed: q={q_rate:.2f} p={p_rate:.2f} "
-                  f"t={time.time()-t_rate_start:.3f}s")
+        dt = time.time() - t_rec_start
+        v_lateral = np.sqrt(vx**2 + vy**2)
+        if not phase4_settled and dt > 0.5 and theta_err < 0.2 and np.linalg.norm(omega) < 0.5:
+            print(f"[backflip]   upright at t={dt:.2f}s, v_lat={v_lateral:.2f} — decelerating")
+            phase4_settled = True
+
+        if phase4_settled and v_lateral < 0.5 and abs(vz) < 0.5:
+            print(f"[backflip]   hovering: v_lat={v_lateral:.2f} vz={vz:.2f} "
+                  f"z={x_now[2]:.2f}  t={dt:.2f}s")
             break
+
         time.sleep(0.002)
 
-    x_post_kill = _current_state()
-    print(f"[backflip] Post-kill: z={x_post_kill[2]:.2f}m  "
-          f"q={x_post_kill[11]:.2f}  p={x_post_kill[10]:.2f}  "
-          f"qw={x_post_kill[6]:.3f}")
+    x_rec = _current_state()
+    v_lat = np.sqrt(x_rec[3]**2 + x_rec[4]**2)
+    print(f"[backflip] Post-recovery: z={x_rec[2]:.2f}m  vz={x_rec[5]:.2f}  "
+          f"v_lat={v_lat:.2f}  xy=({x_rec[0]:.1f},{x_rec[1]:.1f})")
 
-    # Phase 4b: MPC recovery with boosted damping
-    print(f"[backflip] Phase 4b: MPC recovery")
-    _mpc.reset_bounds()
-    _mpc.set_bounds(f_min=0.0, tau_max=0.40)
-
-    W_recover = _mpc._W.copy()
-    W_recover[10, 10] = 80.0   # Q_omega p
-    W_recover[11, 11] = 80.0   # Q_omega q
-    W_recover[12, 12] = 20.0   # Q_omega_r
-    W_recover[6, 6]   = 5.0    # Q_att qw
-    W_recover[7, 7]   = 5.0    # Q_att qx
-    W_recover[8, 8]   = 5.0    # Q_att qy
-    W_recover[9, 9]   = 5.0    # Q_att qz
-    WN_recover = W_recover[:13, :13].copy()
-    WN_recover[10, 10] = 40.0
-    WN_recover[11, 11] = 40.0
-    WN_recover[12, 12] = 10.0
-    _mpc.set_weights(W=W_recover, WN=WN_recover)
-    _mpc.reset(_current_state())
-
-    recover_pos = _current_state()[:3]
-    recover_target = np.array([recover_pos[0], recover_pos[1],
-                               max(recover_pos[2], 3.0)])
-    traj_recover = WaypointTrajectory(
-        [{'pos': recover_pos, 'vel': [0,0,0]},
-         {'pos': recover_target, 'vel': [0,0,0]}],
-        seg_times=[4.0])
-
-    _run_loop(traj_recover, 6.0)
+    # Phase 5: MPC return to origin + landing
+    # Drone is now hovering — MPC should work from clean state
+    print(f"[backflip] Phase 5: MPC return to origin")
     _mpc.reset_weights()
     _mpc.reset_bounds()
     _mpc.reset(_current_state())
+    curr = _current_state()[:3]
+    origin = np.array([0.0, 0.0, alt])
+    dist = np.linalg.norm(curr - origin)
+    T_return = max(dist / 2.0, 3.0)
+    traj_return = WaypointTrajectory(
+        [{'pos': curr, 'vel': [0,0,0]},
+         {'pos': origin, 'vel': [0,0,0]}],
+        seg_times=[T_return])
+    _run_loop(traj_return, T_return + 3.0)
 
-    print(f"[backflip] Phase 5: landing")
+    print(f"[backflip] Phase 6: landing")
     final = _current_state()[:3]
-    print(f"  Recovery position: ({final[0]:.2f}, {final[1]:.2f}, {final[2]:.2f})")
+    print(f"  Position: ({final[0]:.2f}, {final[1]:.2f}, {final[2]:.2f})")
+    landing()
+
+
+def backflip_ilc(alt: float = 10.0, spinup_wait: float = 3.0,
+                 log_tag: str = '') -> None:
+    """Backflip with tuned params and PD position-feedback recovery."""
+    global _flip_mode
+    if not log_tag:
+        log_tag = f"backflip_ilc_{time.strftime('%H%M%S')}"
+    assert _mpc is not None, "Call setup() first"
+
+    f_accel    = 8.77
+    f_decel    = 8.81
+    f_popup    = 2.0 * MASS * G
+    T_popup    = 0.40
+    f_coast    = 0.15 * MASS * G
+    tau_flip   = 0.9
+    I_yy       = I_DIAG[1]
+    alpha_nom  = tau_flip / I_yy
+    theta_accel_end  = np.radians(45)
+    theta_target     = 2 * np.pi
+    alpha_eff_decel  = alpha_nom * 0.60
+    vx_bias    = 0.0
+    vy_bias    = 0.0
+    T_burst    = 0.30
+
+    print(f"[flip] f_accel={f_accel:.2f}N  f_decel={f_decel:.2f}N  "
+          f"bias=({vx_bias:+.3f},{vy_bias:+.3f})")
+
+    if alt < 5.0:
+        print("[flip] WARNING: need at least 5m altitude")
+        return
+
+    start()
+    print(f"[flip] spin-up ({spinup_wait:.0f}s)...")
+    for i in range(int(spinup_wait), 0, -1):
+        print(f"  {i}s", end='\r')
+        time.sleep(1.0)
+    print()
+
+    # Phase 1: MPC climb
+    curr_pos = _current_state()[:3]
+    target = np.array([curr_pos[0], curr_pos[1], alt])
+    traj_climb, T_climb = _build_goto_traj(curr_pos, target)
+    _session_open(log_tag)
+    _mpc.reset(_current_state())
+    print(f"[flip] Phase 1: climb to z={alt:.1f}m")
+    _run_loop(traj_climb, T_climb + 2.0)
+
+    # Stabilize hover before flip
+    hover_state = _current_state()
+    hover_pos = hover_state[:3].copy()
+    print(f"[flip] Hover: ({hover_pos[0]:.2f}, {hover_pos[1]:.2f}, {hover_pos[2]:.2f})")
+
+    # Phase 2: pop-up
+    print(f"[flip] Phase 2: pop-up (f={f_popup:.1f}N, {T_popup:.3f}s)")
+    t_popup_start = time.time()
+    t_global_base = time.time() - _session_t0
+    while time.time() - t_popup_start < T_popup:
+        dt_p = time.time() - t_popup_start
+        x_now = _current_state()
+        if _session:
+            _session['t'].append(t_global_base + dt_p)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+            _session['u'].append(np.array([f_popup, 0.0, 0.0, 0.0]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+        wrench_to_rotorcraft(f_popup, 0.0, 0.0, 0.0)
+        time.sleep(0.002)
+
+    x_popup = _current_state()
+    print(f"[flip] Post pop-up: z={x_popup[2]:.2f}m vz={x_popup[5]:.2f} m/s")
+
+    # Phase 3: flip
+    print(f"[flip] Phase 3: FLIP!")
+    _flip_mode = True
+    t_flip_start = time.time()
+    t_global_base = time.time() - _session_t0
+    prev_time = t_flip_start
+    cumulative_pitch = 0.0
+    phase = 'accel'
+
+    while True:
+        now = time.time()
+        x_now = _current_state()
+        dt_f = now - prev_time
+        prev_time = now
+        q_rate = x_now[11]
+        cumulative_pitch += q_rate * dt_f
+
+        if phase == 'accel' and cumulative_pitch >= theta_accel_end:
+            phase = 'coast'
+            print(f"[flip]   -> coast at {np.degrees(cumulative_pitch):.0f}° "
+                  f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+        elif phase == 'coast' and q_rate > 0.1:
+            decel_angle = q_rate**2 / (2 * alpha_eff_decel)
+            remaining = theta_target - cumulative_pitch
+            if remaining <= decel_angle:
+                phase = 'decel'
+                print(f"[flip]   -> decel at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  stop={np.degrees(decel_angle):.0f}°  "
+                      f"t={now-t_flip_start:.3f}s")
+
+        if phase == 'decel':
+            if q_rate < 1.0:
+                print(f"[flip]   -> done at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+                break
+            if cumulative_pitch >= np.radians(450):
+                print(f"[flip]   -> overshoot at {np.degrees(cumulative_pitch):.0f}°")
+                break
+
+        if now - t_flip_start > 3.0:
+            print(f"[flip]   -> TIMEOUT at {np.degrees(cumulative_pitch):.0f}° q={q_rate:.1f}")
+            break
+
+        if _session:
+            _session['t'].append(t_global_base + (now - t_flip_start))
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+
+        if phase == 'accel':
+            f_cmd, tau_cmd = f_accel, tau_flip
+        elif phase == 'coast':
+            f_cmd, tau_cmd = f_coast, 0.0
+        else:
+            f_cmd, tau_cmd = f_decel, -tau_flip
+
+        wrench_to_rotorcraft(f_cmd, 0.0, tau_cmd, 0.0)
+
+        if _session:
+            _session['u'].append(np.array([f_cmd, 0.0, tau_cmd, 0.0]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+        time.sleep(0.002)
+
+    x_post = _current_state()
+    print(f"[flip] Post-flip: qw={x_post[6]:.3f}  "
+          f"vel=({x_post[3]:+.2f},{x_post[4]:+.2f},{x_post[5]:+.2f})")
+
+    # Phase 4: SO(3) recovery — PD position + velocity + bias
+    _flip_mode = False
+    Kp_att = 1.5;  Kd_att = 1.2;  K_vz = 3.0
+    K_vxy = 0.10;  K_pos = 0.05
+    tau_budget = tau_flip
+
+    t_rec_start = time.time()
+    phase4_settled = False
+    while time.time() - t_rec_start < 6.0:
+        x_now = _current_state()
+        omega = x_now[10:13]
+        vx, vy, vz = x_now[3], x_now[4], x_now[5]
+        qw, qx, qy, qz = x_now[6], x_now[7], x_now[8], x_now[9]
+        if qw < 0:
+            qw, qx, qy, qz = -qw, -qx, -qy, -qz
+
+        dt_r = time.time() - t_rec_start
+        dx = x_now[0] - hover_pos[0]
+        dy = x_now[1] - hover_pos[1]
+        bx = vx_bias if dt_r < T_burst else 0.0
+        by = vy_bias if dt_r < T_burst else 0.0
+        qx_des = np.clip(K_vxy * (vy + by) + K_pos * dy, -0.20, 0.20)
+        qy_des = np.clip(-K_vxy * (vx + bx) - K_pos * dx, -0.20, 0.20)
+
+        q_err_vec = np.array([qx - qx_des, qy - qy_des, qz])
+        q_err_norm = np.linalg.norm(q_err_vec)
+        if q_err_norm > 1e-6:
+            theta_err = 2.0 * np.arctan2(q_err_norm, qw)
+            axis = q_err_vec / q_err_norm
+        else:
+            theta_err = 0.0
+            axis = np.array([0.0, 0.0, 1.0])
+
+        tau_vec = -Kp_att * theta_err * axis - Kd_att * omega
+        tau_vec[2] = np.clip(tau_vec[2], -0.1, 0.1)
+        tau_norm = np.linalg.norm(tau_vec)
+        if tau_norm > tau_budget:
+            tau_vec = tau_vec / tau_norm * tau_budget
+
+        f_up = MASS * G + np.clip(-K_vz * vz, -MASS * G, MASS * G)
+        f_cmd = np.clip(f_up, 0.5 * MASS * G, 2.0 * MASS * G)
+        wrench_to_rotorcraft(f_cmd, tau_vec[0], tau_vec[1], tau_vec[2])
+
+        if _session:
+            t_global = time.time() - _session_t0
+            _session['t'].append(t_global)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+            _session['u'].append(np.array([f_cmd, tau_vec[0], tau_vec[1], tau_vec[2]]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+
+        v_lateral = np.sqrt(vx**2 + vy**2)
+        if not phase4_settled and dt_r > 0.5 and theta_err < 0.2 and np.linalg.norm(omega) < 0.5:
+            print(f"[flip]   upright at t={dt_r:.2f}s, v_lat={v_lateral:.2f}")
+            phase4_settled = True
+        if phase4_settled and v_lateral < 0.5 and abs(vz) < 0.5:
+            print(f"[flip]   hovering: v_lat={v_lateral:.2f} vz={vz:.2f} z={x_now[2]:.2f}")
+            break
+        time.sleep(0.002)
+
+    x_rec = _current_state()
+    drift_x = x_rec[0] - hover_pos[0]
+    drift_y = x_rec[1] - hover_pos[1]
+    v_lat = np.sqrt(x_rec[3]**2 + x_rec[4]**2)
+    print(f"[flip] Recovery: drift=({drift_x:+.1f},{drift_y:+.1f})m  "
+          f"v_lat={v_lat:.2f}  z={x_rec[2]:.2f}")
+
+    # Phase 5: MPC return + landing
+    _mpc.reset_weights()
+    _mpc.reset_bounds()
+    _mpc.reset(_current_state())
+    curr = _current_state()[:3]
+    origin = np.array([0.0, 0.0, alt])
+    dist = np.linalg.norm(curr - origin)
+    T_return = max(dist / 2.0, 3.0)
+    traj_return = WaypointTrajectory(
+        [{'pos': curr, 'vel': [0,0,0]},
+         {'pos': origin, 'vel': [0,0,0]}],
+        seg_times=[T_return])
+    print(f"[flip] Phase 5: return to origin ({dist:.1f}m)")
+    _run_loop(traj_return, T_return + 3.0)
+
+    final = _current_state()[:3]
+    print(f"[flip] Landing from ({final[0]:.2f}, {final[1]:.2f}, {final[2]:.2f})")
     landing()
 
 

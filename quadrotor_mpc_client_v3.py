@@ -95,7 +95,8 @@ _session_t0: float = 0.0
 def _session_open(tag: str) -> None:
     """Open a new log session. Overwrites previous if still active."""
     global _session, _session_t0
-    _session = dict(tag=tag, t=[], x=[], u=[], xref=[], mpc_ms=[], n_obs=[])
+    _session = dict(tag=tag, t=[], x=[], u=[], xref=[], mpc_ms=[], n_obs=[],
+                    slack=[])
     _session_t0 = time.time()
     print(f"[log] Session opened — tag='{tag}'")
 
@@ -119,7 +120,8 @@ def _session_close() -> str | None:
              u        = np.array(s['u'])        if s['u']      else np.empty((0, 4)),
              xref     = np.array(s['xref']),
              mpc_times= np.array(s['mpc_ms'])   if s['mpc_ms'] else np.empty(0),
-             n_obs    = np.array(s['n_obs'])     if s['n_obs']  else np.empty(0))
+             n_obs    = np.array(s['n_obs'])     if s['n_obs']  else np.empty(0),
+             slack    = np.array(s['slack'])     if s.get('slack') else np.empty(0))
 
     total_s  = s['t'][-1] - s['t'][0] if len(s['t']) > 1 else 0
     avg_ms   = float(np.mean(s['mpc_ms']))  if s['mpc_ms']  else 0.0
@@ -218,7 +220,8 @@ def _build_land_traj(curr_pos, land_z, descent_vel=DESCENT_VEL):
 # ── Control loop ─────────────────────────────────────────────────────────────
 def _run_loop(traj: WaypointTrajectory,
               T_total: float,
-              ground_cutoff: bool = False) -> None:
+              ground_cutoff: bool = False,
+              f_min_clamp: float = None) -> None:
     """
     MPC control loop.
 
@@ -227,11 +230,16 @@ def _run_loop(traj: WaypointTrajectory,
 
     If ground_cutoff=True, exits early when z < GROUND_Z and descending.
 
+    f_min_clamp: lower bound applied to the MPC thrust output each step.
+    Defaults to 0.60*mg (safety floor for normal flight). Pass 0.0 for
+    backflip MPC recovery, which deliberately allows near-zero thrust while
+    righting from an inverted attitude.
+
     Log data written to module-level _session; does not save to disk.
     """
     t_start    = time.time()
     t_next_mpc = t_start
-    f_min_safe = 0.60 * MASS * G
+    f_min_safe = 0.60 * MASS * G if f_min_clamp is None else f_min_clamp
 
     T_traj = traj.total_duration()
 
@@ -660,8 +668,14 @@ def _apf_force_2d(pos_2d, goal_2d, obstacles, k_att=1.0, k_rep=0.8, d0=2.5,
     return f_total
 
 
-def _apf_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel):
-    """Build N+1 reference states by simulating APF forward from current pos."""
+def _apf_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel,
+                 apf_d0=2.5, apf_R_drone=0.50):
+    """Build N+1 reference states by simulating APF forward from current pos.
+
+    apf_d0 / apf_R_drone expose the APF influence distance and drone radius so
+    the margin can be tightened for a fair comparison vs the MPC keep-out.
+    Defaults reproduce the original behaviour.
+    """
     xref = np.zeros((N + 1, 13))
     pos = pos_3d.copy()
     goal_2d = goal_3d[:2]
@@ -674,14 +688,114 @@ def _apf_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel):
             pos[:2] = goal_2d
         else:
             f = _apf_force_2d(pos[:2], goal_2d, obstacles,
-                              R_drone=0.50, obs_signs=obs_signs)
+                              d0=apf_d0, R_drone=apf_R_drone, obs_signs=obs_signs)
             f_norm = np.linalg.norm(f)
             direction = f / f_norm if f_norm > 1e-6 else np.array([1.0, 0.0])
             if direction[0] < 0.1:
                 direction[0] = 0.1
                 direction = direction / np.linalg.norm(direction)
-            speed = min(max_vel, max_vel * dist_to_goal / 1.0)
+            # Gentle braking near the goal (ramp speed with remaining distance)
+            # so high-speed runs do not overshoot / fail to stop at the goal.
+            speed = min(max_vel, dist_to_goal / 1.5)
             vel = np.array([direction[0] * speed, direction[1] * speed, 0.0])
+
+        xref[k, 0:3] = pos
+        xref[k, 3:6] = vel
+        xref[k, 6] = 1.0  # qw
+
+        if k < N:
+            pos = pos.copy()
+            pos[:2] += vel[:2] * Ts
+            pos[2] = goal_3d[2]
+
+    return xref
+
+
+def _goal_horizon(pos_3d, goal_3d, N, Ts, max_vel):
+    """Build N+1 goal-directed reference states — NO obstacle term.
+
+    Pure attractive (go-to-goal) reference: a straight pull toward the goal
+    at capped speed, with no repulsion. Obstacle avoidance is delegated
+    entirely to the NMPC keep-out constraint. Used by slalom_mpc_avoid().
+    Output layout matches _apf_horizon: [p(3), v(3), q(4), w(3)], qw=1.
+    """
+    xref = np.zeros((N + 1, 13))
+    pos = pos_3d.copy()
+    goal_2d = goal_3d[:2]
+
+    for k in range(N + 1):
+        to_goal = goal_2d - pos[:2]
+        dist_to_goal = np.linalg.norm(to_goal)
+
+        if dist_to_goal < 0.3:
+            vel = np.zeros(3)
+            pos[:2] = goal_2d
+        else:
+            direction = to_goal / dist_to_goal
+            # Gentle braking near the goal: ramp speed with remaining distance
+            # so a high-speed run does not have to decelerate abruptly at the
+            # goal (abrupt stop -> hard pitch-back -> tumble).
+            speed = min(max_vel, dist_to_goal / 1.5)
+            vel = np.array([direction[0] * speed, direction[1] * speed, 0.0])
+
+        xref[k, 0:3] = pos
+        xref[k, 3:6] = vel
+        xref[k, 6] = 1.0  # qw
+
+        if k < N:
+            pos = pos.copy()
+            pos[:2] += vel[:2] * Ts
+            pos[2] = goal_3d[2]
+
+    return xref
+
+
+def _homotopy_horizon(pos_3d, goal_3d, obstacles, obs_signs, N, Ts, max_vel,
+                      tangent_gain=0.8, d_influence=2.5):
+    """Goal-directed reference with ONLY a tangential side-bias per obstacle.
+
+    Unlike _apf_horizon (full radial + tangential repulsion, which routes a
+    collision-free path), this adds NO radial push — only a small tangential
+    ("which side to pass") nudge. The reference therefore still approaches
+    close to obstacles, leaving the actual clearance to the MPC keep-out
+    constraint. The reference picks the homotopy class; the MPC enforces
+    safety. Used by slalom_mpc_homotopy().
+    """
+    xref = np.zeros((N + 1, 13))
+    pos = pos_3d.copy()
+    goal_2d = goal_3d[:2]
+
+    for k in range(N + 1):
+        to_goal = goal_2d - pos[:2]
+        dist_to_goal = np.linalg.norm(to_goal)
+
+        if dist_to_goal < 0.3:
+            vel = np.zeros(3)
+            pos[:2] = goal_2d
+        else:
+            direction = to_goal / dist_to_goal          # attractive, no radial
+            tang = np.zeros(2)
+            for idx, (obs_pos, obs_r) in enumerate(obstacles):
+                diff = pos[:2] - obs_pos[:2]
+                od = np.linalg.norm(diff)
+                margin = od - obs_r
+                if 0.01 < margin < d_influence and od > 1e-6:
+                    sign = obs_signs[idx] if obs_signs is not None else 1
+                    t = sign * np.array([-diff[1], diff[0]]) / od
+                    w = tangent_gain * (1.0 - margin / d_influence)
+                    tang += w * t
+            d2 = direction + tang
+            n2 = np.linalg.norm(d2)
+            d2 = d2 / n2 if n2 > 1e-6 else direction
+            # Force forward (+x) progress ONLY while still en route to the goal,
+            # so a tangent term can't stall the drone. Past the goal x, let the
+            # reference point freely (back toward goal) so the drone can stop.
+            if d2[0] < 0.1 and pos[0] < goal_2d[0] - 0.5:
+                d2[0] = 0.1
+                d2 = d2 / np.linalg.norm(d2)
+            # Gentle braking near the goal (see _goal_horizon).
+            speed = min(max_vel, dist_to_goal / 1.5)
+            vel = np.array([d2[0] * speed, d2[1] * speed, 0.0])
 
         xref[k, 0:3] = pos
         xref[k, 3:6] = vel
@@ -699,7 +813,9 @@ def slalom_reactive(alt: float = 2.0,
                     max_vel: float = 2.5,
                     T_timeout: float = 40.0,
                     goal_tol: float = 0.5,
-                    use_perception: bool = False) -> None:
+                    use_perception: bool = False,
+                    apf_d0: float = 2.5,
+                    apf_R_drone: float = 0.50) -> None:
     """
     Real-time APF obstacle avoidance — no pre-planned waypoints.
 
@@ -815,7 +931,8 @@ def slalom_reactive(alt: float = 2.0,
         t_global = time.time() - _session_t0
 
         xref_h = _apf_horizon(x_now[:3], goal_pos, obstacles, obs_signs,
-                              MPC_N, MPC_TS, max_vel)
+                              MPC_N, MPC_TS, max_vel,
+                              apf_d0=apf_d0, apf_R_drone=apf_R_drone)
 
         if _session:
             _session['t'].append(t_global)
@@ -847,6 +964,328 @@ def slalom_reactive(alt: float = 2.0,
 
     # Stop lidar before landing to avoid phantom obstacles during descent
     if use_perception and hasattr(_perception, '_backend'):
+        _perception.stop()
+
+    landing()
+
+
+def slalom_mpc_avoid(alt: float = 2.0,
+                     max_vel: float = 1.5,
+                     safety_margin: float = 0.30,
+                     T_timeout: float = 40.0,
+                     goal_tol: float = 0.5) -> None:
+    """
+    Pure-MPC obstacle avoidance: the reference only says "go to goal", the
+    NMPC keep-out constraint does ALL the avoiding.
+
+    Real-time lidar perception only — NO hardcoded obstacle positions.
+    At each control step:
+      - lidar + DBSCAN detect obstacles online (PerceptionManager level 2),
+      - _goal_horizon() builds a straight goal-directed reference with NO
+        repulsion (APF avoidance is OFF here),
+      - the detected obstacles are passed to the NMPC, whose keep-out
+        constraint  ||p_drone - p_obs||^2 >= (R_obs + R_drone)^2  actively
+        enforces clearance inside the optimal control problem.
+
+    Tuning (added after the 2.5 m/s run collided):
+      - max_vel       (A): slower approach => more reaction distance for the
+                           keep-out to bend the drone around in time.
+      - safety_margin (B): each detected obstacle radius is inflated by this
+                           amount before being handed to the MPC, so the
+                           keep-out activates EARLIER. This is local to this
+                           function — it does NOT change R_drone in the shared
+                           MPC build, so slalom_reactive() is unaffected.
+
+    Difference vs slalom_reactive(): there the MPC is a pure tracker
+    (solve(..., obstacles=[])) and avoidance is done by APF alone. Here the
+    reference carries no obstacle information and the MPC enforces all safety.
+
+        >>> setup(perception_level=2)   # lidar + DBSCAN
+        >>> slalom_mpc_avoid()                       # 1.5 m/s, margin 0.30
+        >>> slalom_mpc_avoid(max_vel=2.0, safety_margin=0.4)  # push faster
+    """
+    assert _perception is not None, "Call setup(perception_level=2) first"
+
+    goal_pos   = np.array([18.0, 0.0, alt])
+    obstacles  = []
+    _known_obs = []   # detected obstacle XY positions (for logging only)
+
+    print(f"[slalom_mpc_avoid] REALTIME lidar perception — MPC keep-out active")
+    print(f"[slalom_mpc_avoid] goal=({goal_pos[0]},{goal_pos[1]},{goal_pos[2]}), "
+          f"max_vel={max_vel}, safety_margin={safety_margin}")
+
+    _session_open('slalom_mpc_avoid')
+    start()
+
+    # Takeoff
+    print(f"[slalom_mpc_avoid] Takeoff to {alt}m...")
+    curr_pos = _current_state()[:3]
+    hover_target = np.array([curr_pos[0], curr_pos[1], alt])
+    traj_up = WaypointTrajectory(
+        [{'pos': curr_pos, 'vel': [0, 0, 0]},
+         {'pos': hover_target, 'vel': [0, 0, 0]}],
+        seg_times=[3.0])
+    _mpc.reset(_current_state())
+    _run_loop(traj_up, 5.0)
+
+    print(f"[slalom_mpc_avoid] Hover stable, starting goal-only ref + MPC avoidance...")
+    _mpc.reset(_current_state())
+
+    t_start = time.time()
+    t_next_mpc = t_start
+    reached_goal = False
+
+    while True:
+        t_now = time.time() - t_start
+        if t_now > T_timeout:
+            print(f"[slalom_mpc_avoid] Timeout ({T_timeout:.0f}s)")
+            break
+
+        x_now = _current_state()
+        dist_to_goal = np.linalg.norm(x_now[:2] - goal_pos[:2])
+
+        if dist_to_goal < goal_tol and not reached_goal:
+            reached_goal = True
+            t_goal = t_now
+            print(f"[slalom_mpc_avoid] Reached goal at t={t_now:.1f}s, holding 1.5s...")
+
+        if reached_goal and t_now - t_goal > 1.5:
+            print(f"[slalom_mpc_avoid] Hold complete.")
+            break
+
+        # ── Real-time obstacle update from lidar (no hardcoded positions) ────
+        # Detected obstacles are handed to the MPC ONLY. The reference
+        # generator never sees them, so every avoidance decision is made by
+        # the NMPC keep-out constraint — APF does no avoidance here.
+        _perception.update_drone_pos(x_now[:3])
+        perceived = _perception.get_obstacles()
+        obstacles = []
+        for obs_pos, obs_r in perceived:
+            if obs_r > 1.0:
+                continue
+            if obs_pos[0] < x_now[0] - 1.5:
+                continue
+            if abs(obs_pos[1]) > 5.0:
+                continue
+
+            # B: inflate radius by safety_margin so the MPC keep-out activates
+            # earlier (more reaction distance). Local to this function — the
+            # shared MPC build / R_drone is untouched.
+            obstacles.append((obs_pos, obs_r + safety_margin))
+
+            is_new = all(np.linalg.norm(obs_pos[:2] - kpos) >= 1.5
+                         for kpos in _known_obs)
+            if is_new:
+                _known_obs.append(obs_pos[:2].copy())
+                print(f"  [perception] new obs({obs_pos[0]:.1f},{obs_pos[1]:.1f}) "
+                      f"r={obs_r:.2f} (+{safety_margin:.2f} margin) -> MPC keep-out")
+
+        t_global = time.time() - _session_t0
+
+        # Goal-ONLY reference (no repulsion). Avoidance is the MPC's job.
+        xref_h = _goal_horizon(x_now[:3], goal_pos, MPC_N, MPC_TS, max_vel)
+
+        if _session:
+            _session['t'].append(t_global)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(xref_h[0].copy())
+
+        if time.time() >= t_next_mpc:
+            # KEY: detected obstacles are passed to the NMPC, so the keep-out
+            # constraint enforces clearance (vs slalom_reactive's obstacles=[]).
+            u_opt, info = _mpc.solve(x_now, xref_h, obstacles=obstacles,
+                                     sign_correct=True)
+
+            if _session:
+                _session['u'].append(u_opt.copy())
+                _session['mpc_ms'].append(info['solve_time_ms'])
+                _session['n_obs'].append(info.get('n_obs_active', len(obstacles)))
+
+            wrench_to_rotorcraft(*u_opt)
+            now = time.time()
+            while t_next_mpc <= now:
+                t_next_mpc += MPC_TS
+
+        time.sleep(0.002)
+
+    # Min clearance per discovered obstacle (over the whole flight)
+    if _session and _known_obs:
+        xs = np.array(_session['x'])
+        for i, kpos in enumerate(_known_obs):
+            dists = np.sqrt((xs[:, 0] - kpos[0])**2 + (xs[:, 1] - kpos[1])**2)
+            print(f"  obs{i+1}@({kpos[0]:.1f},{kpos[1]:.1f}): "
+                  f"min_dist={np.min(dists):.2f}m")
+
+    # Stop lidar before landing to avoid phantom obstacles during descent
+    if hasattr(_perception, '_backend'):
+        _perception.stop()
+
+    landing()
+
+
+def slalom_mpc_homotopy(alt: float = 2.0,
+                        max_vel: float = 2.5,
+                        safety_margin: float = 0.20,
+                        tangent_gain: float = 0.8,
+                        T_timeout: float = 40.0,
+                        goal_tol: float = 1.0) -> None:
+    """
+    Architecture C: the reference gives only a HOMOTOPY HINT (which side to
+    pass); the NMPC keep-out constraint produces the actual clearance.
+
+    Real-time lidar perception only — NO hardcoded obstacle positions.
+    Per control step:
+      - lidar + DBSCAN detect obstacles online,
+      - a pass-side is chosen per obstacle from sign(cross(start->goal, offset)),
+      - _homotopy_horizon() builds a goal-directed reference with ONLY a small
+        tangential side-bias (NO radial repulsion) — the drone still comes
+        close to obstacles,
+      - the detected obstacles are passed to the NMPC keep-out constraint,
+        which enforces clearance. The per-step constraint slack is logged;
+        slack>0 proves the MPC (not the reference) is doing the avoidance.
+
+    Sits between the two baselines kept for comparison:
+      - slalom_reactive   : APF routes a collision-free path, MPC just tracks
+                            (MPC does no avoidance).
+      - slalom_mpc_avoid  : goal-only reference, MPC does 100% reactively
+                            (fragile/unreliable above ~1.4 m/s).
+      - slalom_mpc_homotopy: reference picks the side, MPC enforces safety
+                            (standard planner-homotopy + MPC-clearance design).
+
+        >>> setup(perception_level=2)
+        >>> slalom_mpc_homotopy()
+    """
+    assert _perception is not None, "Call setup(perception_level=2) first"
+
+    goal_pos   = np.array([18.0, 0.0, alt])
+    start_pos  = np.array([0.0, 0.0, alt])
+    line_dir   = goal_pos[:2] - start_pos[:2]
+
+    obstacles  = []
+    obs_signs  = []
+    _known_obs = []   # (xy, sign) per discovered obstacle
+
+    print(f"[slalom_mpc_homotopy] REALTIME lidar — homotopy hint + MPC keep-out")
+    print(f"[slalom_mpc_homotopy] goal=({goal_pos[0]},{goal_pos[1]},{goal_pos[2]}), "
+          f"max_vel={max_vel}, margin={safety_margin}, tangent_gain={tangent_gain}")
+
+    _session_open('slalom_mpc_homotopy')
+    start()
+
+    # Takeoff
+    print(f"[slalom_mpc_homotopy] Takeoff to {alt}m...")
+    curr_pos = _current_state()[:3]
+    hover_target = np.array([curr_pos[0], curr_pos[1], alt])
+    traj_up = WaypointTrajectory(
+        [{'pos': curr_pos, 'vel': [0, 0, 0]},
+         {'pos': hover_target, 'vel': [0, 0, 0]}],
+        seg_times=[3.0])
+    _mpc.reset(_current_state())
+    _run_loop(traj_up, 5.0)
+
+    print(f"[slalom_mpc_homotopy] Hover stable, starting homotopy ref + MPC avoidance...")
+    _mpc.reset(_current_state())
+
+    t_start = time.time()
+    t_next_mpc = t_start
+    reached_goal = False
+
+    while True:
+        t_now = time.time() - t_start
+        if t_now > T_timeout:
+            print(f"[slalom_mpc_homotopy] Timeout ({T_timeout:.0f}s)")
+            break
+
+        x_now = _current_state()
+        dist_to_goal = np.linalg.norm(x_now[:2] - goal_pos[:2])
+
+        if dist_to_goal < goal_tol and not reached_goal:
+            reached_goal = True
+            t_goal = t_now
+            print(f"[slalom_mpc_homotopy] Reached goal at t={t_now:.1f}s, holding 1.5s...")
+
+        if reached_goal and t_now - t_goal > 1.5:
+            print(f"[slalom_mpc_homotopy] Hold complete.")
+            break
+
+        # ── Real-time detection + per-obstacle pass-side decision ────────────
+        _perception.update_drone_pos(x_now[:3])
+        perceived = _perception.get_obstacles()
+        obstacles = []
+        obs_signs = []
+        for obs_pos, obs_r in perceived:
+            if obs_r > 1.0:
+                continue
+            if obs_pos[0] < x_now[0] - 1.5:
+                continue
+            if abs(obs_pos[1]) > 5.0:
+                continue
+
+            # inflate radius slightly so the keep-out has reaction room
+            obstacles.append((obs_pos, obs_r + safety_margin))
+
+            matched_sign = None
+            for kpos, ksign in _known_obs:
+                if np.linalg.norm(obs_pos[:2] - kpos) < 1.5:
+                    matched_sign = ksign
+                    break
+            if matched_sign is not None:
+                obs_signs.append(matched_sign)
+            else:
+                obs_off = obs_pos[:2] - start_pos[:2]
+                cross = line_dir[0] * obs_off[1] - line_dir[1] * obs_off[0]
+                sign = +1 if cross >= 0 else -1
+                _known_obs.append((obs_pos[:2].copy(), sign))
+                obs_signs.append(sign)
+                print(f"  [perception] new obs({obs_pos[0]:.1f},{obs_pos[1]:.1f}) "
+                      f"r={obs_r:.2f} -> pass {'right' if cross >= 0 else 'left'}")
+
+        t_global = time.time() - _session_t0
+
+        # Homotopy-hint reference: goal pull + tangential side-bias, NO repulsion
+        xref_h = _homotopy_horizon(x_now[:3], goal_pos, obstacles, obs_signs,
+                                   MPC_N, MPC_TS, max_vel, tangent_gain)
+
+        if _session:
+            _session['t'].append(t_global)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(xref_h[0].copy())
+
+        if time.time() >= t_next_mpc:
+            # Obstacles fed to the MPC -> keep-out constraint enforces clearance.
+            u_opt, info = _mpc.solve(x_now, xref_h, obstacles=obstacles,
+                                     sign_correct=True)
+
+            if _session:
+                _session['u'].append(u_opt.copy())
+                _session['mpc_ms'].append(info['solve_time_ms'])
+                _session['n_obs'].append(info.get('n_obs_active', len(obstacles)))
+                _session['slack'].append(info.get('slack_max', 0.0))
+
+            wrench_to_rotorcraft(*u_opt)
+            now = time.time()
+            while t_next_mpc <= now:
+                t_next_mpc += MPC_TS
+
+        time.sleep(0.002)
+
+    # Min clearance per discovered obstacle
+    if _session and _known_obs:
+        xs = np.array(_session['x'])
+        for i, (kpos, ksign) in enumerate(_known_obs):
+            dists = np.sqrt((xs[:, 0] - kpos[0])**2 + (xs[:, 1] - kpos[1])**2)
+            print(f"  obs{i+1}@({kpos[0]:.1f},{kpos[1]:.1f}): "
+                  f"min_dist={np.min(dists):.2f}m")
+
+    # MPC-activity proof: fraction of steps where the keep-out was binding
+    if _session and _session['slack']:
+        sl = np.array(_session['slack'])
+        active = float(np.mean(sl > 1e-6)) * 100
+        print(f"  [MPC keep-out] slack>0 in {active:.0f}% of steps, "
+              f"max slack={sl.max():.3f}  (slack>0 => MPC actively avoiding)")
+
+    # Stop lidar before landing to avoid phantom obstacles during descent
+    if hasattr(_perception, '_backend'):
         _perception.stop()
 
     landing()
@@ -1333,6 +1772,273 @@ def backflip_ilc(alt: float = 10.0, spinup_wait: float = 3.0,
 
     final = _current_state()[:3]
     print(f"[flip] Landing from ({final[0]:.2f}, {final[1]:.2f}, {final[2]:.2f})")
+    landing()
+
+
+def backflip_mpc_recovery(alt: float = 10.0,
+             tau_flip: float = 1.1,   # drift-tune: 0.9->1.1, faster flip = less time tilted = less drift
+             spinup_wait: float = 3.0,
+             log_tag: str = 'backflip_mpc_rec') -> None:
+    """
+    Backflip (first-pushed version) — MPC-based recovery.
+    Lupashin 5-phase bang-coast-bang; Phase 4a brief open-loop rate-kill,
+    Phase 4b genuine MPC recovery with boosted damping weights.
+
+    Phases:
+      1. MPC climb to altitude and hover
+      2. Open-loop pop-up impulse (gain upward velocity)
+      3. Open-loop flip: accel(+tau) → coast(freefall) → decel(-tau)
+      4. MPC recovery
+      5. MPC landing
+
+    Angle tracking uses quaternion-based Euler pitch (unwrapped),
+    not body-rate integration, to handle gyroscopic coupling.
+
+        >>> setup()
+        >>> backflip()
+    """
+    global _flip_mode
+    assert _mpc is not None, "Call setup() first"
+
+    I_yy = I_DIAG[1]
+    f_bang = 0.70 * MASS * G
+    f_coast = 0.15 * MASS * G
+    alpha_nom = tau_flip / I_yy
+
+    theta_accel_end = np.radians(45)
+    theta_decel_start = np.radians(270)
+    theta_done = np.radians(300)
+
+    print(f"[bf_mpcrec] Lupashin 5-phase (bang-coast-bang):")
+    print(f"  tau={tau_flip:.2f} Nm  alpha_nom={alpha_nom:.1f} rad/s²")
+    print(f"  f_bang={f_bang:.1f}N  f_coast={f_coast:.1f}N (rotor idle)")
+    print(f"  Quat-pitch tracking: accel→coast at {np.degrees(theta_accel_end):.0f}°, "
+          f"coast→decel at {np.degrees(theta_decel_start):.0f}°")
+
+    if alt < 5.0:
+        print(f"[bf_mpcrec] WARNING: need at least 5m altitude")
+        return
+
+    start()
+    print(f"[bf_mpcrec] waiting for spin-up ({spinup_wait:.0f}s)...")
+    for i in range(int(spinup_wait), 0, -1):
+        print(f"[bf_mpcrec]   {i}s", end='\r')
+        time.sleep(1.0)
+    print()
+
+    # Phase 1: climb to altitude
+    curr_pos = _current_state()[:3]
+    target = np.array([curr_pos[0], curr_pos[1], alt])
+    traj_climb, T_climb = _build_goto_traj(curr_pos, target)
+
+    _session_open(log_tag)
+    _mpc.reset(_current_state())
+
+    print(f"[bf_mpcrec] Phase 1: climbing to z={alt:.1f}m")
+    _run_loop(traj_climb, T_climb + 2.0)
+
+    # Hover point captured before the flip — return target after recovery.
+    hover_pos = _current_state()[:3].copy()
+    print(f"[bf_mpcrec] Hover before flip: "
+          f"({hover_pos[0]:.2f},{hover_pos[1]:.2f},{hover_pos[2]:.2f})")
+
+    # Phase 2: pop-up impulse
+    f_popup = 2.0 * MASS * G
+    T_popup = 0.40
+    print(f"[bf_mpcrec] Phase 2: pop-up (f={f_popup:.1f}N, {T_popup:.2f}s)")
+
+    t_popup_start = time.time()
+    t_global_base = time.time() - _session_t0
+    while time.time() - t_popup_start < T_popup:
+        dt = time.time() - t_popup_start
+        x_now = _current_state()
+        if _session:
+            _session['t'].append(t_global_base + dt)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+            _session['u'].append(np.array([f_popup, 0.0, 0.0, 0.0]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+        wrench_to_rotorcraft(f_popup, 0.0, 0.0, 0.0)
+        time.sleep(0.002)
+
+    x_popup = _current_state()
+    print(f"[bf_mpcrec] Post pop-up: z={x_popup[2]:.2f}m vz={x_popup[5]:.2f} m/s")
+
+    # Phase 3: flip with quaternion-based pitch tracking
+    print(f"[bf_mpcrec] Phase 3: FLIP!")
+    _flip_mode = True
+
+    t_flip_start = time.time()
+    t_global_base = time.time() - _session_t0
+    prev_pitch = _quat_pitch(_current_state())
+    cumulative_pitch = 0.0
+    phase = 'accel'
+
+    while True:
+        now = time.time()
+        x_now = _current_state()
+
+        curr_pitch = _quat_pitch(x_now)
+        d_pitch = curr_pitch - prev_pitch
+        if d_pitch > np.pi:
+            d_pitch -= 2 * np.pi
+        elif d_pitch < -np.pi:
+            d_pitch += 2 * np.pi
+        cumulative_pitch += d_pitch
+        prev_pitch = curr_pitch
+
+        q_rate = x_now[11]
+
+        if phase == 'accel' and cumulative_pitch >= theta_accel_end:
+            phase = 'coast'
+            print(f"[bf_mpcrec]   -> coast at {np.degrees(cumulative_pitch):.0f}° "
+                  f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+
+        elif phase == 'coast' and cumulative_pitch >= theta_decel_start:
+            phase = 'decel'
+            print(f"[bf_mpcrec]   -> decel at {np.degrees(cumulative_pitch):.0f}° "
+                  f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+
+        if phase == 'decel':
+            if cumulative_pitch >= theta_done and abs(q_rate) < 1.5:
+                print(f"[bf_mpcrec]   -> done at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+                break
+            if cumulative_pitch >= np.radians(300) and q_rate < -1.0:
+                print(f"[bf_mpcrec]   -> over-braked at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+                break
+            if cumulative_pitch >= np.radians(420):
+                print(f"[bf_mpcrec]   -> overshoot at {np.degrees(cumulative_pitch):.0f}° "
+                      f"q={q_rate:.1f}  t={now-t_flip_start:.3f}s")
+                break
+
+        if now - t_flip_start > 3.0:
+            print(f"[bf_mpcrec]   -> TIMEOUT at {np.degrees(cumulative_pitch):.0f}° "
+                  f"q={q_rate:.1f}")
+            break
+
+        if _session:
+            _session['t'].append(t_global_base + (now - t_flip_start))
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+
+        if phase == 'accel':
+            f_cmd, tau_cmd = f_bang, tau_flip
+        elif phase == 'coast':
+            f_cmd, tau_cmd = f_coast, 0.0
+        else:
+            f_cmd, tau_cmd = f_bang, -tau_flip
+
+        wrench_to_rotorcraft(f_cmd, 0.0, tau_cmd, 0.0)
+
+        if _session:
+            _session['u'].append(np.array([f_cmd, 0.0, tau_cmd, 0.0]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+
+        time.sleep(0.002)
+
+    x_after = _current_state()
+    print(f"[bf_mpcrec] Post-flip: z={x_after[2]:.2f}m  vz={x_after[5]:.2f}  "
+          f"qw={x_after[6]:.3f}  pitch_rate={x_after[11]:.1f} rad/s")
+
+    # Phase 4a: open-loop rate kill (P-controller on pitch rate)
+    _flip_mode = False
+    print(f"[bf_mpcrec] Phase 4a: rate kill")
+    K_rate = 0.04
+    t_rate_start = time.time()
+    while time.time() - t_rate_start < 0.8:
+        x_now = _current_state()
+        q_rate = x_now[11]
+        p_rate = x_now[10]
+        r_rate = x_now[12]
+
+        tau_y = np.clip(-K_rate * q_rate, -tau_flip, tau_flip)
+        tau_x = np.clip(-K_rate * p_rate, -0.3, 0.3)
+        tau_z = np.clip(-0.02 * r_rate, -0.06, 0.06)
+
+        pitch_err = _quat_pitch(x_now)
+        f_hold = MASS * G * max(np.cos(pitch_err), 0.3)
+
+        wrench_to_rotorcraft(f_hold, tau_x, tau_y, tau_z)
+
+        if _session:
+            t_global = time.time() - _session_t0
+            _session['t'].append(t_global)
+            _session['x'].append(x_now.copy())
+            _session['xref'].append(x_now.copy())
+            _session['u'].append(np.array([f_hold, tau_x, tau_y, tau_z]))
+            _session['mpc_ms'].append(0.0)
+            _session['n_obs'].append(0)
+
+        if abs(q_rate) < 0.5 and abs(p_rate) < 0.5:
+            print(f"[bf_mpcrec]   rates killed: q={q_rate:.2f} p={p_rate:.2f} "
+                  f"t={time.time()-t_rate_start:.3f}s")
+            break
+        time.sleep(0.002)
+
+    x_post_kill = _current_state()
+    print(f"[bf_mpcrec] Post-kill: z={x_post_kill[2]:.2f}m  "
+          f"q={x_post_kill[11]:.2f}  p={x_post_kill[10]:.2f}  "
+          f"qw={x_post_kill[6]:.3f}")
+
+    # Phase 4b: MPC recovery with boosted damping
+    print(f"[bf_mpcrec] Phase 4b: MPC recovery")
+    _mpc.reset_bounds()
+    _mpc.set_bounds(f_min=0.0, tau_max=0.40)
+
+    W_recover = _mpc._W.copy()
+    W_recover[10, 10] = 80.0   # Q_omega p
+    W_recover[11, 11] = 80.0   # Q_omega q
+    W_recover[12, 12] = 20.0   # Q_omega_r
+    W_recover[6, 6]   = 5.0    # Q_att qw
+    W_recover[7, 7]   = 5.0    # Q_att qx
+    W_recover[8, 8]   = 5.0    # Q_att qy
+    W_recover[9, 9]   = 5.0    # Q_att qz
+    WN_recover = W_recover[:13, :13].copy()
+    WN_recover[10, 10] = 40.0
+    WN_recover[11, 11] = 40.0
+    WN_recover[12, 12] = 10.0
+    _mpc.set_weights(W=W_recover, WN=WN_recover)
+    _mpc.reset(_current_state())
+
+    recover_pos = _current_state()[:3]
+    recover_target = np.array([recover_pos[0], recover_pos[1],
+                               max(recover_pos[2], 3.0)])
+    traj_recover = WaypointTrajectory(
+        [{'pos': recover_pos, 'vel': [0,0,0]},
+         {'pos': recover_target, 'vel': [0,0,0]}],
+        seg_times=[4.0])
+
+    # f_min_clamp=0.0: recovery set_bounds(f_min=0.0) must not be overridden
+    # by the _run_loop 0.60*mg safety floor, else thrust can't drop while
+    # righting from inversion (this floor was added after the first push and
+    # is what broke the original MPC recovery).
+    _run_loop(traj_recover, 6.0, f_min_clamp=0.0)
+    _mpc.reset_weights()
+    _mpc.reset_bounds()
+    _mpc.reset(_current_state())
+
+    # Phase 5: MPC return to the pre-flip hover point, hold to settle
+    rec = _current_state()[:3]
+    print(f"[bf_mpcrec] Phase 5: return to hover point "
+          f"(from ({rec[0]:.2f},{rec[1]:.2f},{rec[2]:.2f}))")
+    return_vel = 3.0                          # faster than cruise to cut return time
+    return_target = np.array([hover_pos[0], hover_pos[1], alt])
+    dist = np.linalg.norm(rec - return_target)
+    T_return = max(dist / return_vel, 2.5)
+    traj_return = WaypointTrajectory(
+        [{'pos': rec,           'vel': [0, 0, 0]},
+         {'pos': return_target, 'vel': [0, 0, 0]}],
+        seg_times=[T_return])
+    _run_loop(traj_return, T_return + 2.5)    # +2.5s hold to converge above start
+
+    print(f"[bf_mpcrec] Phase 6: landing at hover point")
+    final = _current_state()[:3]
+    print(f"  Position: ({final[0]:.2f}, {final[1]:.2f}, {final[2]:.2f})  "
+          f"target=({hover_pos[0]:.2f},{hover_pos[1]:.2f})")
     landing()
 
 

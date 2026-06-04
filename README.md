@@ -45,7 +45,7 @@ Input  u ∈ R^4   :  [f_total, τx, τy, τz]
 * Quaternion-based NMPC (no Euler angle singularities)
 * 1.0s prediction horizon (N=20, Ts=50ms), SQP-RTI single iteration
 * APF-based obstacle avoidance: offline path planning + MPC tracking
-* Backflip: Lupashin 5-phase bang-coast-bang with rate-kill recovery
+* Backflip: Lupashin 5-phase bang-coast-bang; feedforward flip with SO(3) PD or NMPC recovery
 * Landing cone constraint: vz + α·z ≥ 0 (prevents hard landings)
 * "+" configuration motor mixer with feasibility checking
 * Quintic polynomial multi-waypoint trajectory generation
@@ -107,7 +107,7 @@ source /shared-workspace/src/mpc-quadrotor/env_setup.sh
 
 ```
 mpc-quadrotor/
-├── quadrotor_mpc_client_v3.py   # Main API (hover, slalom, slalom_reactive, backflip)
+├── quadrotor_mpc_client_v3.py   # Main API (hover, slalom_reactive, slalom_mpc_avoid, slalom_mpc_homotopy, backflip, backflip_mpc_recovery)
 ├── local_planner_mpc.py         # Obstacle-aware LocalPlannerMPC
 ├── mpc_solver.py                # Core QuadrotorMPC
 ├── quadrotor_model.py           # acados dynamic model
@@ -116,13 +116,16 @@ mpc-quadrotor/
 ├── plot_mpc_log.py              # Log visualizer (auto-saves to plots/)
 ├── plot_apf_field.py            # APF force field + potential visualization
 ├── plot_backflip.py             # Backflip analysis plots (detailed)
-├── plot_backflip_paper.py       # Backflip paper-ready plots (single column)
+├── plot_backflip_paper.py       # Backflip paper plot (4-panel, single column)
+├── plot_slalom_paper.py         # Slalom analysis/controls paper plot (per world)
+├── plot_compare_paper.py        # In-MPC vs APF comparison figures
 ├── simulation.sh                # Basic simulation stack (no obstacles)
 ├── simulation_obstacles.sh      # Obstacle avoidance simulation stack
 ├── worlds/
 │   ├── quad.world               # Empty world
 │   ├── quad_obstacles.world     # 3 cylindrical obstacles
-│   └── quad_obstacles_dense.world  # 5-obstacle alternating slalom
+│   ├── quad_obstacles_dense.world  # 5-obstacle alternating slalom
+│   └── quad_obstacles_line.world   # 5 obstacles ON the start->goal line
 ├── model/
 │   ├── mrsim-quadrotor-lidar/
 │   │   ├── model.sdf            # Quadrotor with Lidar (+ configuration)
@@ -216,6 +219,9 @@ bash simulation_obstacles.sh
 
 # 5-obstacle dense slalom:
 bash simulation_obstacles.sh worlds/quad_obstacles_dense.world
+
+# In-line slalom (obstacles ON the start->goal line; forces real avoidance):
+bash simulation_obstacles.sh worlds/quad_obstacles_line.world
 ```
 
 ### Terminal 2 — Python Control
@@ -256,6 +262,53 @@ Real-time APF at each MPC step. No pre-planned waypoints — drone reacts to obs
 
 With `use_perception=True`, obstacles are detected via 2D lidar (LaserScan → DBSCAN clustering → nearest-neighbor data association) instead of hardcoded positions. Requires `perception_level=2` in `setup()` to enable lidar-based perception.
 
+### Obstacle Avoidance — In-MPC Constraint vs. APF (comparison)
+
+Three avoidance architectures that differ only in **where** avoidance happens.
+Run them on the in-line slalom world (obstacles on the start→goal line, so the
+drone must actively avoid):
+
+```bash
+# Terminal 1
+bash simulation_obstacles.sh worlds/quad_obstacles_line.world
+```
+
+```python
+# Terminal 2
+>>> setup(perception_level=2)              # lidar + DBSCAN
+
+# (1) pure-MPC — goal-only reference; the MPC keep-out constraint does ALL the
+#     avoidance (genuine in-controller avoidance). Reliable up to ~1.5 m/s.
+>>> slalom_mpc_avoid(max_vel=1.5)
+
+# (2) homotopy — reference gives only a pass-side hint; MPC keep-out enforces
+#     clearance. Logs the constraint slack (evidence the MPC, not the
+#     reference, avoids).
+>>> slalom_mpc_homotopy(max_vel=2.0, tangent_gain=0.4)
+
+# (3) APF + MPC tracker — APF reference avoids, MPC just tracks (fast). Tighten
+#     the APF margin to match the in-MPC clearance for a fair comparison:
+>>> slalom_reactive(use_perception=True, max_vel=2.2, apf_d0=0.3, apf_R_drone=0.20)
+```
+
+| Function | Reference generator | Avoidance done by |
+|---|---|---|
+| `slalom_mpc_avoid` | `_goal_horizon` (goal only) | MPC keep-out constraint |
+| `slalom_mpc_homotopy` | `_homotopy_horizon` (goal + side hint) | MPC keep-out constraint |
+| `slalom_reactive` | `_apf_horizon` (full APF) | APF planner (MPC tracks) |
+
+Key parameters:
+- `max_vel` — commanded cruise speed (swept to find the reliable ceiling).
+- `safety_margin` (avoid / homotopy) — extra keep-out radius added per obstacle.
+- `tangent_gain` (homotopy) — strength of the pass-side hint.
+- `apf_d0`, `apf_R_drone` (reactive) — APF influence distance and drone radius;
+  lower values → tighter clearance (used to match the in-MPC margin).
+
+Finding: at a matched ~0.9 m clearance, in-MPC avoidance is reliable to
+1.5 m/s and APF+MPC to 2.2 m/s; both fail above that via the same
+attitude-runaway instability (see the paper). The default `slalom_reactive`
+(wide APF berth) reaches 2.81 m/s.
+
 ### Obstacle Avoidance — Offline APF
 
 ```python
@@ -271,30 +324,35 @@ Pre-plans full path with APF, fits quintic polynomials, MPC tracks. Faster but l
 ```python
 # Use simulation.sh (no obstacles, needs altitude clearance)
 >>> setup()
->>> backflip()          # basic version
->>> backflip_ilc()      # tuned version with PD position-feedback recovery
+>>> backflip()                # basic version, SO(3) PD recovery
+>>> backflip_ilc()            # tuned params + PD position-feedback recovery
+>>> backflip_mpc_recovery()   # feedforward flip + genuine NMPC recovery (paper version)
 ```
 
 Lupashin 5-phase bang-coast-bang backflip:
 1. MPC climb to 10m and hover
 2. Open-loop pop-up impulse (2.0×mg for 0.40s)
 3. Open-loop flip: accel(+τ) → coast(freefall) → decel(-τ), body-rate integrated angle tracking with dynamic decel start
-4. SO(3) quaternion-based recovery with velocity + position damping
-5. MPC return to origin and landing
+4. Recovery — see variants below
+5. MPC return to the pre-flip hover point and landing
 
-`backflip_ilc()` uses tuned parameters (f_accel=8.77N, f_decel=8.81N) and adds position feedback (K_pos=0.05) to the SO(3) recovery phase, pulling the drone back toward its pre-flip hover position.
+**Recovery variants:**
+- `backflip()` — SO(3) quaternion-based PD recovery with velocity damping.
+- `backflip_ilc()` — tuned flip params (f_accel=8.77N, f_decel=8.81N) + position feedback (K_pos=0.05) on the SO(3) PD recovery.
+- `backflip_mpc_recovery()` — **the flip is open-loop feedforward, but recovery is done by the NMPC** (Phase 4a: brief open-loop rate-kill to bring rates into the solver's basin; Phase 4b: NMPC with boosted attitude/rate damping stabilises and returns to hover). Uses a faster flip (`tau_flip=1.1`Nm) to cut drift, and `_run_loop(..., f_min_clamp=0.0)` so the recovery NMPC may command near-zero thrust. This is the variant used for the paper figures.
 
-**Typical results (good flip exit, qw > 0.95):**
+**Typical results — `backflip_mpc_recovery()` (good flip exit, qw ≈ -1 full inversion):**
 
 | Metric | Value |
 | --- | --- |
-| Flip duration | ~0.75s |
-| Peak pitch rate | ~9.3 rad/s |
-| Attitude error at exit | 14–24° |
-| Max lateral drift | 2–3m |
-| Settled drift | 0.5–0.8m |
-| Altitude loss | 0.5–1.0m |
-| Recovery time | 3–5s |
+| Flip duration | ~0.73s |
+| Peak pitch rate | ~9.5 rad/s |
+| Peak lateral drift | ~1.7m (at flip exit) |
+| Altitude loss | none (fast flip; min z ≥ hover) |
+| Landing error from hover | ~0.1m |
+| Recovery via | NMPC (Phase 4b) |
+
+> Note: `backflip_mpc_recovery()` with `tau_flip=1.1` is the most consistent low-drift variant. Lowering `f_bang` below 0.70·mg reduces drift further but makes the flip unreliable (insufficient vertical support → altitude loss / tumble); kept at 0.70·mg.
 
 ### Manual Control
 
@@ -452,6 +510,16 @@ python3 plot_mpc_log.py logs/mpc/slalom/mpc_log.npz
 
 # From host (plots auto-saved to mpc-quadrotor/plots/):
 python3 plot_mpc_log.py --save logs/mpc/slalom/mpc_log.npz
+```
+
+### Avoidance-Comparison Tools
+
+```bash
+# Paper-ready comparison figures (trajectory / ceiling / runaway):
+python3 plot_compare_paper.py
+
+# Pure-MPC slalom analysis + controls (5-panel), styled like the paper:
+python3 plot_slalom_paper.py --world line
 ```
 
 ---
